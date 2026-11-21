@@ -14,9 +14,22 @@
 #include <stdexcept>
 #include <utility>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+
+#ifdef _WIN32
+#define INGINE_CLOSE ::_close
+#else
+#define INGINE_CLOSE ::close
+#endif
 
 namespace ingine {
 namespace {
@@ -106,13 +119,23 @@ Tensor SafetensorsTensor::view(void* data) const {
 }
 
 SafetensorsFile::SafetensorsFile(const std::filesystem::path& path) : path_(path) {
+#ifdef _WIN32
+    fd_ = ::_wopen(path.c_str(), _O_RDONLY | _O_BINARY | _O_NOINHERIT);
+#else
     fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+#endif
     if (fd_ < 0) { fail_errno(path_, "open failed"); }
     try {
+#ifdef _WIN32
+        struct _stat64 st {};
+        if (::_fstat64(fd_, &st) != 0) { fail_errno(path_, "fstat failed"); }
+        file_size_ = static_cast<std::uint64_t>(st.st_size);
+#else
         struct stat st {};
         if (::fstat(fd_, &st) != 0) { fail_errno(path_, "fstat failed"); }
         file_size_ = static_cast<std::uint64_t>(st.st_size);
         (void)::posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
 
         if (file_size_ < 8) { fail(path_, "file shorter than the 8-byte header length"); }
         unsigned char len_bytes[8];
@@ -199,14 +222,14 @@ SafetensorsFile::SafetensorsFile(const std::filesystem::path& path) : path_(path
         index_.reserve(tensors_.size());
         for (std::size_t i = 0; i < tensors_.size(); ++i) { index_.emplace(tensors_[i].name, i); }
     } catch (...) {
-        ::close(fd_);
+        INGINE_CLOSE(fd_);
         fd_ = -1;
         throw;
     }
 }
 
 SafetensorsFile::~SafetensorsFile() {
-    if (fd_ >= 0) { ::close(fd_); }
+    if (fd_ >= 0) { INGINE_CLOSE(fd_); }
 }
 
 SafetensorsFile::SafetensorsFile(SafetensorsFile&& other) noexcept
@@ -217,7 +240,7 @@ SafetensorsFile::SafetensorsFile(SafetensorsFile&& other) noexcept
 
 SafetensorsFile& SafetensorsFile::operator=(SafetensorsFile&& other) noexcept {
     if (this != &other) {
-        if (fd_ >= 0) { ::close(fd_); }
+        if (fd_ >= 0) { INGINE_CLOSE(fd_); }
         path_        = std::move(other.path_);
         fd_          = std::exchange(other.fd_, -1);
         file_size_   = other.file_size_;
@@ -256,11 +279,24 @@ void SafetensorsFile::read_range(std::uint64_t offset, std::uint64_t bytes, void
     while (bytes > 0) {
         const std::size_t want =
             static_cast<std::size_t>(std::min<std::uint64_t>(bytes, std::uint64_t(1) << 30));
+#ifdef _WIN32
+        // Positional read on the OS handle (thread-safe like pread; the CRT file position is unused).
+        OVERLAPPED ov{};
+        ov.Offset     = static_cast<DWORD>(offset & 0xffffffffu);
+        ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
+        DWORD got_w   = 0;
+        if (!::ReadFile(reinterpret_cast<HANDLE>(::_get_osfhandle(fd_)), out, static_cast<DWORD>(want), &got_w,
+                        &ov)) {
+            fail(path_, "ReadFile failed: error " + std::to_string(::GetLastError()));
+        }
+        const std::int64_t got = got_w;
+#else
         const ssize_t got = ::pread(fd_, out, want, static_cast<off_t>(offset));
         if (got < 0) {
             if (errno == EINTR) { continue; }
             fail_errno(path_, "pread failed");
         }
+#endif
         if (got == 0) { fail(path_, "unexpected end of file"); }
         out += got;
         offset += static_cast<std::uint64_t>(got);

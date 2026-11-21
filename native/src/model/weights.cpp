@@ -14,6 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -61,12 +62,32 @@ std::vector<float> host_f32(const SafetensorsModel& m, const std::string& name) 
 
 class Loader {
  public:
-  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, std::vector<DeviceBuffer>& storage)
-      : m_(m), up_(up), stream_(stream), storage_(storage) {}
+  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, std::vector<DeviceBuffer>& storage,
+         std::vector<std::unique_ptr<MappedHostBuffer>>* host_storage = nullptr)
+      : m_(m), up_(up), stream_(stream), storage_(storage), host_storage_(host_storage) {}
 
   void* alloc(std::size_t bytes) {
     storage_.emplace_back(bytes);
     return storage_.back().p;
+  }
+
+  // Mapped page-locked host block; returns its device pointer (kernels read it over PCIe, zero-copy).
+  void* alloc_host(std::size_t bytes) {
+    if (!host_storage_) throw std::logic_error("weights: no host storage");
+    host_storage_->push_back(std::make_unique<MappedHostBuffer>(bytes));
+    return host_storage_->back()->device_ptr();
+  }
+
+  // Raw checkpoint tensor in mapped host memory (read from the file by the CPU now), viewed through its
+  // device pointer.
+  Tensor raw_host(const std::string& name) {
+    const SafetensorsRef ref = m_.at(name);
+    host_storage_ ? void() : throw std::logic_error("weights: no host storage");
+    host_storage_->push_back(std::make_unique<MappedHostBuffer>(ref->bytes));
+    MappedHostBuffer& b = *host_storage_->back();
+    const UploadRequest r = upload_request(ref, b.device_ptr());
+    r.file->read_range(r.offset, r.bytes, b.data());
+    return ref->view(b.device_ptr());
   }
 
   Tensor upload_f32(const std::vector<float>& host, std::initializer_list<std::int32_t> shape) {
@@ -117,6 +138,7 @@ class Loader {
   DeviceUploader& up_;
   cudaStream_t stream_;
   std::vector<DeviceBuffer>& storage_;
+  std::vector<std::unique_ptr<MappedHostBuffer>>* host_storage_ = nullptr;
   std::vector<UploadRequest> pending_;
 };
 
@@ -165,7 +187,7 @@ Dense row_view(const Dense& d, int begin, int end) {
   return v;
 }
 
-Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
+Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, bool host_experts = false) {
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   Layer layer;
@@ -295,10 +317,12 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   const std::string e = p + "mlp.experts.";
   Experts& ex = layer.experts;
   ex.fmt = fmt;
-  ex.w13 = ld.raw(e + "w13_weight");
-  ex.w13_scale = ld.raw(e + "w13_weight_scale");
-  ex.w2 = ld.raw(e + "w2_weight");
-  ex.w2_scale = ld.raw(e + "w2_weight_scale");
+  ex.host = host_experts;
+  auto raw_ex = [&](const std::string& n) { return host_experts ? ld.raw_host(n) : ld.raw(n); };
+  ex.w13 = raw_ex(e + "w13_weight");
+  ex.w13_scale = raw_ex(e + "w13_weight_scale");
+  ex.w2 = raw_ex(e + "w2_weight");
+  ex.w2_scale = raw_ex(e + "w2_weight_scale");
   const bool nv = fmt == ExpertFormat::NVFP4;
   const std::string want_codes = nv ? "U8" : "F8_E4M3", want_scales = nv ? "F8_E4M3" : "U8";
   if (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
@@ -331,16 +355,20 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
 
 }  // namespace
 
-Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream) {
+Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream,
+                     const std::vector<int>& host_layers, bool host_embed) {
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;
   w.dense_fp8 = dense_fp8;
   w.expert_formats = expert_formats(model_dir);
   w.storage.reserve(4096);
-  Loader ld(m, up, stream, w.storage);
+  Loader ld(m, up, stream, w.storage, &w.host_storage);
   const int H = HIDDEN;
-  for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8));
+  for (int l = 0; l < LAYERS; ++l) {
+    const bool host = std::find(host_layers.begin(), host_layers.end(), l) != host_layers.end();
+    w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8, host));
+  }
 
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
@@ -356,7 +384,7 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     }
     w.message_queries = ld.upload_f32(mq, {n, 4, H});
   }
-  w.embed = ld.raw("model.llm.embed.weight");
+  w.embed = host_embed ? ld.raw_host("model.llm.embed.weight") : ld.raw("model.llm.embed.weight");
   if (w.embed.dtype != DType::BF16) throw std::runtime_error("weights: embed must be BF16");
   w.embed_norm = ld.f32("model.llm.embed_norm.weight", {H});
   w.final_query = ld.f32("model.llm.attn_res.output_query", {1, H});

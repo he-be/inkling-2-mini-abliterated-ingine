@@ -67,6 +67,17 @@ class Prefiller {
   __nv_bfloat16* wscratch_;  // dequantized FP8 rows of wproj / wo (dense_fp8)
   std::int64_t* ids_;
   int kpos_rows_;
+
+  // host-resident experts (Experts::host): copied to two device staging buffers, kStageExperts at a time,
+  // on copy_stream_ while the previous group's GEMM runs
+  static constexpr int kStageExperts = 16;
+  std::uint8_t* stage_codes_[2] = {nullptr, nullptr};
+  std::uint8_t* stage_scales_[2] = {nullptr, nullptr};
+  std::size_t stage_code_bytes_ = 0, stage_scale_bytes_ = 0;  // per buffer
+  cudaStream_t copy_stream_ = nullptr;
+  cudaEvent_t copied_[2] = {}, used_[2] = {};
+  void staged_experts(const Experts& ex, bool up, const __nv_bfloat16* in, int T, const void* work,
+                      __nv_bfloat16* out);
 };
 
 }  // namespace ingine::model

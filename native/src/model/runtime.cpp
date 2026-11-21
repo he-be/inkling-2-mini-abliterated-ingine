@@ -64,7 +64,7 @@ void GraphExec::launch(cudaStream_t stream) const {
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_);
+  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_, options.host_layers, options.host_embed);
   ablation_ = load_ablation(options.ablation);
   init();
 }

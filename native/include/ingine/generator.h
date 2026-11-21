@@ -68,6 +68,10 @@ struct RuntimeOptions {
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
   // min(3072, free memory after start-up - 4096), at least 0.
   int park_mb = -1;
+  // Memory-constrained GPUs (RTX 5080 16 GB): layers whose routed experts (codes + block scales) live in
+  // mapped page-locked host memory, read by the kernels over PCIe; host_embed: the token table too.
+  std::vector<int> host_layers;
+  bool host_embed = false;
 };
 
 class Generator {

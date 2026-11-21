@@ -15,3 +15,5 @@ results/serve-*.log
 /work
 # native (C++) build trees
 /native/build*
+native/build-win/
+native/build-win.log

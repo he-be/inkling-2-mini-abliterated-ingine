@@ -8,11 +8,13 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/host_memory.h"
 #include "core/tensor.h"
 
 #include <array>
 #include <cstdint>
 #include <initializer_list>
+#include <memory>
 #include <vector>
 
 namespace ingine::model {
@@ -141,6 +143,7 @@ struct Experts {
   //        w2_scale u8 [128, 2304, 36], factors empty
   Tensor w13, w13_scale, w2, w2_scale;
   Tensor w13_factor, w2_factor;
+  bool host = false;  // codes and block scales in mapped host memory (host_layers): prefill stages them
 };
 
 // weights.Layer plus the per-layer derived tensors of fast.FastDecoder (_concat_projections,
@@ -204,6 +207,7 @@ struct Weights {
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
 
   std::vector<DeviceBuffer> storage;  // device allocations behind the views
+  std::vector<std::unique_ptr<MappedHostBuffer>> host_storage;  // mapped host memory (host_layers / host_embed)
 };
 
 // model.Ablation: per visit y <- y - w * r * (r . y) on the attention / MLP writes. Without an ablation

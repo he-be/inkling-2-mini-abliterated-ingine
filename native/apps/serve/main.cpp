@@ -9,7 +9,12 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#ifdef _WIN32
+#include <atomic>
+#include <chrono>
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -21,14 +26,42 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
+#ifdef _WIN32
+// Windows: no self-pipe; the handler (run on its own thread for console events) sets a flag the main thread polls.
+std::atomic<bool> g_stop{false};
+
+void handle_signal(int) { g_stop.store(true); }
+#else
 int g_stop_pipe[2] = {-1, -1};
 
 void handle_signal(int) {
   const char c = 's';
   (void)!::write(g_stop_pipe[1], &c, 1);
+}
+#endif
+
+// "0-3,18-23" -> {0, 1, 2, 3, 18, ..., 23} ("+" also separates: cmd.exe splits arguments at commas).
+std::vector<int> parse_layers(std::string spec) {
+  for (char& c : spec) if (c == '+') c = ',';
+  std::vector<int> out;
+  std::size_t i = 0;
+  while (i < spec.size()) {
+    std::size_t j = spec.find(',', i);
+    if (j == std::string::npos) j = spec.size();
+    const std::string part = spec.substr(i, j - i);
+    if (!part.empty()) {
+      const std::size_t d = part.find('-');
+      const int a = std::stoi(part.substr(0, d));
+      const int b = d == std::string::npos ? a : std::stoi(part.substr(d + 1));
+      for (int l = a; l <= b; ++l) out.push_back(l);
+    }
+    i = j + 1;
+  }
+  return out;
 }
 
 // tokenizer_config.json "model_max_length" (the Python server's fallback context limit), else 1 << 20.
@@ -92,6 +125,12 @@ int main(int argc, char** argv) {
             "device memory (MiB) for conversations displaced by another one, released when memory runs short, "
             "0 = off (default: min(3072, free memory after start-up - 4096))",
             &park_mb);
+  std::string host_experts;
+  bool host_embed = false;
+  ap.option("--host-experts", "LAYERS",
+            "layers whose routed experts stay in page-locked RAM, read over PCIe (e.g. 0-3,18-23; '+' also separates)",
+            &host_experts);
+  ap.flag("--host-embed", "keep the token embedding table in page-locked RAM", &host_embed);
   ap.option("--fake-delay", "", "seconds per fake token", &fake_delay);
   ap.option("--model-id", "", "model name reported by the API (default: generator.model_id)", &model_id);
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
@@ -114,7 +153,9 @@ int main(int argc, char** argv) {
     std::cerr << "ingine-serve: error: unknown level: '" << log_level << "'\n";
     return 2;
   }
+#ifndef _WIN32
   std::signal(SIGPIPE, SIG_IGN);
+#endif
 
   try {
     const ingine::text::ChatFormat fmt = ingine::text::ChatFormat::load(model_dir);
@@ -134,6 +175,8 @@ int main(int argc, char** argv) {
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
+      options.host_layers = parse_layers(host_experts);
+      options.host_embed = host_embed;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");
@@ -157,7 +200,9 @@ int main(int argc, char** argv) {
       return 1;
     }
 
+#ifndef _WIN32
     if (::pipe(g_stop_pipe) != 0) throw std::runtime_error("pipe() failed");
+#endif
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
     log.info("serving {} on http://{}:{}/v1", server.model_id(), host, server.port());
@@ -166,9 +211,13 @@ int main(int argc, char** argv) {
       listened = server.listen();
       handle_signal(0);  // the accept loop ended on its own: wake the main thread
     });
+#ifdef _WIN32
+    while (!g_stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+#else
     char c;
     while (::read(g_stop_pipe[0], &c, 1) < 0 && errno == EINTR) {
     }
+#endif
     server.stop();
     listener.join();
     if (!listened) {

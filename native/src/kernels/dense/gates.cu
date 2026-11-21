@@ -76,19 +76,21 @@ struct GateCfg {
   static constexpr int ROW = RANK * FGB;          // bytes of one forget/gain row
   static constexpr int RS = ROW + 16;             // padded row stride in shared memory (no bank conflicts)
   static constexpr int SLICE = CPC * RS;          // bytes of one padded matrix slice
-  static_assert(CPC <= NT && ROW % 16 == 0 && RPC == 4, "uneven split");
+  static_assert(CPC <= NT && ROW % 16 == 0 && RPC % 4 == 0, "uneven split");
   static constexpr int SMEM = 2 * SLICE;
-  static constexpr int XMAX = FG32 ? 1 : 4;       // tokens staged per barrier (one staging buffer each)
+  // tokens staged per barrier (one staging buffer each); 8-CTA clusters (RTX 5080) stage one token, so the
+  // larger slices still fit in shared memory
+  static constexpr int XMAX = FG32 || CL < 16 ? 1 : 4;
 };
 
 template <int CL, bool FG32, int M>
 __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a) {
   using C = GateCfg<CL, FG32>;
   constexpr int DCH = H / (8 * 32);  // 9 chunks of 8 down weights per lane
-  constexpr int XPT = H / C::NT;     // inputs per thread per half when staging x
+  constexpr int XPT = (H + C::NT - 1) / C::NT;  // inputs per thread per half when staging x
+  constexpr bool XFULL = H % C::NT == 0;        // CL = 8 (512 threads) leaves a partial last column
   constexpr int MQ = (M + 3) / 4;    // 16-byte stores holding M values
   constexpr int XG = M < C::XMAX ? M : C::XMAX;  // tokens per staging group
-  static_assert(H % C::NT == 0, "x staging split");
   extern __shared__ __align__(16) uint8_t fg[];  // forget slice, then gain slice (padded rows)
   __shared__ __align__(16) float gall[M][RANK];  // full down output (BF16 values), received
   // bf16([n(h), n(msg)]) of the tokens of a group (M = 1 with FP16 slices: two, the shared-memory size the
@@ -111,7 +113,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     mb_init(mb_g);
     mb_init(mb_s);
     fence_mbarrier_init();
-    mb_expect(mb_g, 16u * CL * M);
+    mb_expect(mb_g, 16u * CL * M * (C::RPC / 4));
     mb_expect(mb_s, 16u * CL * MQ);
   }
   cluster_arrive_relaxed();  // waited for before the first remote store
@@ -155,8 +157,9 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
       if (m < M) {
 #pragma unroll
         for (int k = 0; k < XPT; ++k) {
-          xh[j][k] = hg[size_t(m) * H + k * C::NT + t];
-          xm[j][k] = mg[size_t(m) * H + k * C::NT + t];
+          const bool in = XFULL || k * C::NT + t < H;
+          xh[j][k] = in ? hg[size_t(m) * H + k * C::NT + t] : 0.f;
+          xm[j][k] = in ? mg[size_t(m) * H + k * C::NT + t] : 0.f;
           sh = fmaf(xh[j][k], xh[j][k], sh);
           sm = fmaf(xm[j][k], xm[j][k], sm);
         }
@@ -172,8 +175,10 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
         __nv_bfloat16* xb = xs[j];
 #pragma unroll
         for (int k = 0; k < XPT; ++k) {
-          xb[k * C::NT + t] = __float2bfloat16_rn(xh[j][k] * rh);
-          xb[H + k * C::NT + t] = __float2bfloat16_rn(xm[j][k] * rm);
+          if (XFULL || k * C::NT + t < H) {
+            xb[k * C::NT + t] = __float2bfloat16_rn(xh[j][k] * rh);
+            xb[H + k * C::NT + t] = __float2bfloat16_rn(xm[j][k] * rm);
+          }
         }
       }
     }
@@ -200,13 +205,13 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   __syncthreads();
 
   cluster_wait();  // all CTAs resident, barriers initialised: remote stores may start
-  if (t < M * CL) {  // thread (token m, destination d): the token's 4 rows as one 16-byte store
-    const int m = t % M, d = t / M;
-    const float4 p0 = *reinterpret_cast<const float4*>(&part[m][0][0]);
-    const float4 p1 = *reinterpret_cast<const float4*>(&part[m][1][0]);
+  if (t < M * CL * (C::RPC / 4)) {  // thread (token m, destination d, chunk q): 4 of the token's rows, one 16-byte store
+    const int m = t % M, d = (t / M) % CL, q = t / (M * CL);
+    const float4 p0 = *reinterpret_cast<const float4*>(&part[m][0][4 * q]);
+    const float4 p1 = *reinterpret_cast<const float4*>(&part[m][1][4 * q]);
     const float4 v = make_float4(round_bf16(p0.x + p1.x), round_bf16(p0.y + p1.y), round_bf16(p0.z + p1.z),
                                  round_bf16(p0.w + p1.w));
-    st_async4(remote(smem_u32(&gall[m][rank * C::RPC]), d), v, remote(mb_g, d));
+    st_async4(remote(smem_u32(&gall[m][rank * C::RPC + 4 * q]), d), v, remote(mb_g, d));
   }
   // this thread's channel inputs fly during the exchange
   const int c = rank * C::CPC + t;
@@ -332,8 +337,32 @@ void message_gates(const float* h, bool h_shared, const float* msg, int G, int M
   a.zero = 0;
   // 16-CTA clusters (non-portable, verified schedulable on the RTX 5090): the FP32 forget/gain slices of
   // an 8-CTA split would not fit in shared memory.
+  // On GPUs whose GPCs cannot host a 16-CTA cluster of this kernel (RTX 5080: 12 SMs per GPC) the BF16
+  // variant runs with 8-CTA clusters (its slices fit); checked once with the occupancy API.
+  static const bool cl16 = [] {
+    auto k = gates_kernel<16, false, 1>;
+    using C = GateCfg<16, false>;
+    if (cudaFuncSetAttribute(k, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess ||
+        cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return false;
+    }
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(16);
+    cfg.blockDim = dim3(C::NT);
+    cfg.dynamicSmemBytes = C::SMEM;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim.x = 16; attr[0].val.clusterDim.y = 1; attr[0].val.clusterDim.z = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    int n = 0;
+    if (cudaOccupancyMaxActiveClusters(&n, k, &cfg) != cudaSuccess) { (void)cudaGetLastError(); n = 0; }
+    return n > 0;
+  }();
   if (fg_fp32) launch_gates<16, true>(G, M, a, pdl, stream);
-  else launch_gates<16, false>(G, M, a, pdl, stream);
+  else if (cl16) launch_gates<16, false>(G, M, a, pdl, stream);
+  else launch_gates<8, false>(G, M, a, pdl, stream);
 }
 
 }  // namespace ingine::kernels::dense

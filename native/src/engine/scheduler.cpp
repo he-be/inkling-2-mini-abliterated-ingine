@@ -2,7 +2,10 @@
 
 #include "engine/log.h"
 
+#ifndef _MSC_VER
 #include <cxxabi.h>
+#endif
+#include <string_view>
 
 #include <algorithm>
 #include <cstdio>
@@ -26,11 +29,19 @@ std::string random_hex32() {
 }
 
 std::string type_name(const std::exception& e) {
+#ifdef _MSC_VER
+  std::string_view n = typeid(e).name();  // "class std::invalid_argument"
+  for (std::string_view p : {"class ", "struct "}) {
+    if (n.substr(0, p.size()) == p) n.remove_prefix(p.size());
+  }
+  return std::string(n);
+#else
   int status = 0;
   char* name = abi::__cxa_demangle(typeid(e).name(), nullptr, nullptr, &status);
   std::string out = status == 0 && name ? name : typeid(e).name();
   std::free(name);
   return out;
+#endif
 }
 
 }  // namespace
