@@ -121,7 +121,7 @@ def expert_formats(model_dir: Path) -> dict[int, str]:
 
 
 def load_layer(model_dir: str | Path, l: int, device: str = "cuda", reader: _Reader | None = None,
-               fmt: dict[int, str] | None = None) -> Layer:
+               fmt: dict[int, str] | None = None, expert_reader: _Reader | None = None) -> Layer:
     """One decoder layer's weights (about 0.8 GB with its experts) in ingine layouts."""
     model_dir = Path(model_dir)
     r = reader or _Reader(model_dir, device)
@@ -171,8 +171,9 @@ def load_layer(model_dir: str | Path, l: int, device: str = "cuda", reader: _Rea
             t[f"{gate}_gate_forget"] = f32(p + f"controllers.{ckpt}.forget_weight")
             t[f"{gate}_gate_gain"] = f32(p + f"controllers.{ckpt}.gain_weight")
     e = p + "mlp.experts."
-    ex = Experts(fmt=fmt[l], w13=r.get(e + "w13_weight"), w13_scale=r.get(e + "w13_weight_scale"),
-                 w2=r.get(e + "w2_weight"), w2_scale=r.get(e + "w2_weight_scale"))
+    re_ = expert_reader or r  # the codes and block scales (the factors below stay on `device`)
+    ex = Experts(fmt=fmt[l], w13=re_.get(e + "w13_weight"), w13_scale=re_.get(e + "w13_weight_scale"),
+                 w2=re_.get(e + "w2_weight"), w2_scale=re_.get(e + "w2_weight_scale"))
     if fmt[l] == "nvfp4":
         ex.w13_factor = (r.get(e + "w13_weight_amax").float() / r.get(e + "w13_weight_outer_scale_denominator").float()).contiguous()
         ex.w2_factor = (r.get(e + "w2_weight_amax").float() / r.get(e + "w2_weight_outer_scale_denominator").float()).contiguous()
@@ -180,13 +181,50 @@ def load_layer(model_dir: str | Path, l: int, device: str = "cuda", reader: _Rea
     return layer
 
 
-def load(model_dir: str | Path, device: str = "cuda") -> Weights:
+def host_mapped(t: torch.Tensor) -> torch.Tensor:
+    """Copy of CPU tensor `t` in mapped page-locked host memory, returned as a CUDA tensor (same dtype and
+    shape) that kernels read over PCIe (zero-copy). Nothing of it is resident in VRAM."""
+    from . import ext
+    t = t.contiguous()
+    nbytes = t.numel() * t.element_size()
+    cpu, dev = ext.load("hostmap").host_alloc(nbytes)
+    cpu.copy_(t.view(-1).view(torch.uint8))
+    return dev.view(t.dtype).view(t.shape)
+
+
+def parse_layers(spec: str | None) -> set[int]:
+    """"20-23,0" -> {0, 20, 21, 22, 23}."""
+    out: set[int] = set()
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        a, _, b = part.partition("-")
+        out.update(range(int(a), int(b or a) + 1))
+    return out
+
+
+def load(model_dir: str | Path, device: str = "cuda", host_layers: set[int] | None = None,
+         host_embed: bool = False) -> Weights:
+    """`host_layers`: layers whose routed experts live in mapped page-locked RAM instead of VRAM;
+    `host_embed`: the embedding table too (one row per token is read)."""
     model_dir = Path(model_dir)
     r = _Reader(model_dir, device)
+    host_layers = host_layers or set()
+    rc = _Reader(model_dir, "cpu") if host_layers or host_embed else None
     fmt = expert_formats(model_dir)
     f32 = lambda name: r.get(name).float().contiguous()  # noqa: E731
     bf16 = lambda name: r.get(name).to(torch.bfloat16).contiguous()  # noqa: E731
-    layers = [load_layer(model_dir, l, device, r, fmt) for l in range(LAYERS)]
+    layers = []
+    for l in range(LAYERS):
+        if l in host_layers:
+            layer = load_layer(model_dir, l, device, r, fmt, expert_reader=rc)
+            ex = layer.experts
+            for name in ("w13", "w13_scale", "w2", "w2_scale"):
+                setattr(ex, name, host_mapped(getattr(ex, name)))
+        else:
+            layer = load_layer(model_dir, l, device, r, fmt)
+        layers.append(layer)
 
     queries = r.get("model.llm.middle_cycle_cross_pass_queries").float().unflatten(0, (-1, 2))
     kv_queries = r.get("model.llm.middle_cycle_cross_pass_kv_queries").float().unflatten(0, (-1, 2))
@@ -194,7 +232,8 @@ def load(model_dir: str | Path, device: str = "cuda") -> Weights:
 
     return Weights(
         layers=layers,
-        embed=bf16("model.llm.embed.weight"),
+        embed=(host_mapped(rc.get("model.llm.embed.weight").to(torch.bfloat16)) if host_embed
+               else bf16("model.llm.embed.weight")),
         embed_norm=f32("model.llm.embed_norm.weight"),
         final_query=f32("model.llm.attn_res.output_query").view(1, HIDDEN),
         final_norm=f32("model.llm.norm.weight"),

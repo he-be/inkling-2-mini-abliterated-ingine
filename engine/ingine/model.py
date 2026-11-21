@@ -219,7 +219,8 @@ class Model:
         self.ablation = ablation or Ablation.none(device)
         self.lut = torch.tensor(E2M1, dtype=torch.float32, device=device)
         self.device = device
-        self._scratch13 = self._scratch2 = None  # BF16 expert scratch for grouped prefill (2 GB, lazy)
+        self._scratch13 = self._scratch2 = None  # BF16 expert scratch for grouped prefill (lazy)
+        self.prefill_group = W.EXPERTS  # experts per scratch fill (128 = 2 GB, the original)
         self.capture_taps = False
         self.last_taps: torch.Tensor | None = None
 
@@ -325,17 +326,33 @@ class Model:
         hit = counts.nonzero().flatten()
         offs = counts[hit].cumsum(0).to(torch.int32)
         n = hit.numel()
+        G = self.prefill_group  # experts decoded to BF16 at a time (scratch = G x 10.6 MB + G x 5.3 MB)
         if self._scratch13 is None:
-            self._scratch13 = torch.empty(W.EXPERTS, 2 * W.INTER, HIDDEN, dtype=torch.bfloat16, device=xb.device)
-            self._scratch2 = torch.empty(W.EXPERTS, HIDDEN, W.INTER, dtype=torch.bfloat16, device=xb.device)
+            self._scratch13 = torch.empty(G, 2 * W.INTER, HIDDEN, dtype=torch.bfloat16, device=xb.device)
+            self._scratch2 = torch.empty(G, HIDDEN, W.INTER, dtype=torch.bfloat16, device=xb.device)
         dq = _prefill_ext().dequant_experts
         hit32 = hit.to(torch.int32)
-        w13, w2 = self._scratch13[:n], self._scratch2[:n]
-        dq(e.w13, e.w13_scale, e.w13_factor, hit32, w13)
-        dq(e.w2, e.w2_scale, e.w2_factor, hit32, w2)
-        gu = torch._grouped_mm(xb[tok], w13.transpose(1, 2), offs=offs).float()
-        act = self._act(gu[:, 0::2], gu[:, 1::2]).to(torch.bfloat16)
-        down = torch._grouped_mm(act, w2.transpose(1, 2), offs=offs).float()
+        xs = xb[tok]
+        if n <= G:
+            w13, w2 = self._scratch13[:n], self._scratch2[:n]
+            dq(e.w13, e.w13_scale, e.w13_factor, hit32, w13)
+            dq(e.w2, e.w2_scale, e.w2_factor, hit32, w2)
+            gu = torch._grouped_mm(xs, w13.transpose(1, 2), offs=offs).float()
+            act = self._act(gu[:, 0::2], gu[:, 1::2]).to(torch.bfloat16)
+            down = torch._grouped_mm(act, w2.transpose(1, 2), offs=offs).float()
+        else:  # experts in groups of G; the rows of a group are contiguous (pairs are sorted by expert)
+            ends = [0] + offs.tolist()
+            down = torch.empty(T * TOP_K, HIDDEN, device=xb.device)
+            for g0 in range(0, n, G):
+                g1 = min(g0 + G, n)
+                r0, r1 = ends[g0], ends[g1]
+                w13, w2 = self._scratch13[:g1 - g0], self._scratch2[:g1 - g0]
+                dq(e.w13, e.w13_scale, e.w13_factor, hit32[g0:g1], w13)
+                dq(e.w2, e.w2_scale, e.w2_factor, hit32[g0:g1], w2)
+                o = offs[g0:g1] - r0
+                gu = torch._grouped_mm(xs[r0:r1], w13.transpose(1, 2), offs=o).float()
+                act = self._act(gu[:, 0::2], gu[:, 1::2]).to(torch.bfloat16)
+                down[r0:r1] = torch._grouped_mm(act, w2.transpose(1, 2), offs=o).float()
         # Each (token, slot) pair occurs once: place the weighted outputs by pair, then sum each token's 8 slots
         # in slot order. (index_add_ would accumulate with atomics in a run-dependent order, so a prompt's
         # state, and greedy output after it, would differ from run to run.)

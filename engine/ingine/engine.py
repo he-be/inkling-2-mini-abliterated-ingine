@@ -35,15 +35,18 @@ class Stats:
 class Engine:
     def __init__(self, model_dir: str | Path, max_ctx: int = 65536, ablation: str | None = None,
                  backend: str = "torch", graph: bool = True, prefill_chunk: int = 2048, dense_fp8: bool = False,
-                 spec: bool = False, spec_threshold: float = 0.8, kv_fp8: bool = False):
+                 spec: bool = False, spec_threshold: float = 0.8, kv_fp8: bool = False,
+                 host_experts: str | None = None, host_embed: bool = False, prefill_group: int = W.EXPERTS):
         from transformers import AutoTokenizer
         self.model_dir = Path(model_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
         self.model_id = "inkling-2-mini" + ("-abliterated" if ablation else "")
         t = time.time()
-        self.weights = W.load(self.model_dir)
+        self.host_layers = W.parse_layers(host_experts)
+        self.weights = W.load(self.model_dir, host_layers=self.host_layers, host_embed=host_embed)
         self.abl = M.Ablation.load(ablation) if ablation else M.Ablation.none()
         self.model = M.Model(self.weights, self.abl)
+        self.model.prefill_group = prefill_group
         self.state = M.State(max_ctx, kv_fp8=kv_fp8)
         self.max_model_len = max_ctx
         self.max_ctx = max_ctx

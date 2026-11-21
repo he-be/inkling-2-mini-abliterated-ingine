@@ -1,4 +1,4 @@
-"""attn_decode against an FP64 oracle built from `Model._qkv` (projection post-processing, convs, states)
+﻿"""attn_decode against an FP64 oracle built from `Model._qkv` (projection post-processing, convs, states)
 and the semantics of `Model._attend` (cross-checked against it where memory allows), with real weights of
 sliding layers 0 and 7 and full layers 5 and 23; full layers with BF16 and FP8 (E4M3) caches."""
 from __future__ import annotations
@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import torch
 
-torch.cuda.set_per_process_memory_fraction(0.06)
+torch.cuda.set_per_process_memory_fraction(0.15)
 
 from ingine import ext, weights as W  # noqa: E402
 from ingine.model import Model, l2_clip, linear, rms_norm  # noqa: E402
@@ -61,7 +61,7 @@ def full(request):
 # --------------------------------------------------------------------------------------------- inputs
 
 def to_cache(x, dtype):
-    """BF16 keys/values as a cache of `dtype` holds them: FP8 is E4M3, nearest even, saturated to ±448."""
+    """BF16 keys/values as a cache of `dtype` holds them: FP8 is E4M3, nearest even, saturated to ﾂｱ448."""
     return x if dtype == torch.bfloat16 else x.clamp(-448, 448).to(dtype)
 
 

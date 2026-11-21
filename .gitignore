@@ -12,3 +12,5 @@ results/serve-*.log
 /.run
 # tools/publish_hf.py staging (default)
 /work
+.venv/
+engine/build/

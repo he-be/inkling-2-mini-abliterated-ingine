@@ -25,6 +25,11 @@ _flex = torch.compile(flex_attention, dynamic=True)
 # the full score matrix.
 torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
 BLOCK = 128  # FlexAttention's default query/key block
+# Kernel tiles: torch 2.11's defaults for FP32 inputs at head_dim 128 need 115 KB of shared memory, over the
+# 99 KB an sm_120 block may use (RTX 5080 with this torch); smaller tiles fit. Empty = the defaults.
+import os as _os
+KERNEL_OPTIONS = ({k: int(v) for k, v in (kv.split("=") for kv in _os.environ.get(
+    "INGINE_FLEX_OPTS", "BLOCK_M=64,BLOCK_N=32,num_stages=2,num_warps=4").split(",") if kv)})
 
 
 def block_mask(qpos: torch.Tensor, kpos: torch.Tensor, window: int | None) -> BlockMask:
@@ -83,7 +88,8 @@ def attend(q, keys, values, qpos, kpos, rel_logits, sink, mask: BlockMask):
     try:
         out, lse = _flex(q.float().transpose(0, 1)[None], keys.float().transpose(0, 1)[None],
                          values.float().transpose(0, 1)[None], score_mod=score_mod, block_mask=mask,
-                         scale=1.0 / math.sqrt(HEAD_DIM), enable_gqa=True, return_lse=True)
+                         scale=1.0 / math.sqrt(HEAD_DIM), enable_gqa=True, return_lse=True,
+                         kernel_options=KERNEL_OPTIONS or None)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = tf32
     factor = torch.sigmoid(lse[0] - sink.float().T)  # [24, T]

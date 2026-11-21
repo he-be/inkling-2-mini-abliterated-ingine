@@ -1,4 +1,4 @@
-"""Qualifies the `dense` ops (SPEC.md, area `dense`) against FP64 oracles built from model.py functions.
+﻿"""Qualifies the `dense` ops (SPEC.md, area `dense`) against FP64 oracles built from model.py functions.
 
 Real weights of layers 0, 5, 7, 11, 23 (sliding / full, loop / non-loop) and the real unembedding (all
 200058 rows), M in {1, 2, 8} (plus 3..7 for proj and router), BF16 and FP8 weight paths, FP32 and BF16
@@ -51,7 +51,7 @@ def summary():
 
 @pytest.fixture(scope="module")
 def mod():
-    torch.cuda.set_per_process_memory_fraction(0.06)
+    torch.cuda.set_per_process_memory_fraction(0.15)
     return ext.load("dense")
 
 

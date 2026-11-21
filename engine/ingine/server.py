@@ -555,6 +555,10 @@ def main(argv: list[str] | None = None) -> None:
                      help="FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)")
     eng.add_argument("--spec-threshold", type=float, default=0.8,
                      help="verify the leading drafts whose draft probability exceeds this (0 = always all 7)")
+    eng.add_argument("--host-experts", help="layers whose routed experts stay in mapped page-locked RAM "
+                     "(read by the kernels over PCIe), e.g. 20-23")
+    eng.add_argument("--host-embed", action="store_true", help="embedding table in mapped page-locked RAM")
+    eng.add_argument("--prefill-group", type=int, default=128, help="experts decoded to BF16 at a time in prefill")
     ap.add_argument("--fake-delay", type=float, default=0.02, help="seconds per fake token")
     ap.add_argument("--model-id", help="model name reported by the API (default: generator.model_id)")
     ap.add_argument("--max-queue", type=int, default=4, help="requests allowed to wait behind the running one")
@@ -571,7 +575,8 @@ def main(argv: list[str] | None = None) -> None:
         from .engine import Engine
         generator = Engine(args.model_dir, max_ctx=args.max_ctx, ablation=args.ablation, backend=args.backend,
                            dense_fp8=args.dense_fp8, spec=args.spec, spec_threshold=args.spec_threshold,
-                           kv_fp8=args.kv_fp8)
+                           kv_fp8=args.kv_fp8, host_experts=args.host_experts, host_embed=args.host_embed,
+                           prefill_group=args.prefill_group)
     else:
         mod, _, attr = args.generator.partition(":")
         generator = getattr(importlib.import_module(mod), attr or "create")(args.model_dir, fmt.tokenizer)

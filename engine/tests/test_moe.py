@@ -1,4 +1,4 @@
-"""Qualifies moe_up / moe_down (SPEC.md, area `moe`) against an FP64 oracle built from model.decode_experts.
+﻿"""Qualifies moe_up / moe_down (SPEC.md, area `moe`) against an FP64 oracle built from model.decode_experts.
 
 Real weights of layers 0, 7 (NVFP4) and 20, 23 (MXFP8), M = 1..8, random normalised inputs, distinct experts per token, experts shared across tokens.
 Run with `pytest -s` to see the error summary.
@@ -25,7 +25,7 @@ SUMMARY: list[str] = []
 
 @pytest.fixture(scope="module")
 def mod():
-    torch.cuda.set_per_process_memory_fraction(0.06)
+    torch.cuda.set_per_process_memory_fraction(0.15)
     return ext.load("moe")
 
 

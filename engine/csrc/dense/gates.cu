@@ -61,8 +61,8 @@ template <int CL, bool FG32, int M>
 __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a) {
   using C = GateCfg<CL, FG32>;
   constexpr int DCH = H / (8 * 32);  // 9 chunks of 8 down weights per lane
-  constexpr int XPT = H / C::NT;     // inputs per thread per half when staging x
-  static_assert(H % C::NT == 0, "x staging split");
+  constexpr int XPT = (H + C::NT - 1) / C::NT;  // inputs per thread per half when staging x
+  constexpr bool XFULL = H % C::NT == 0;        // CL = 8 (512 threads) leaves a partial last column
   extern __shared__ __align__(16) uint8_t fg[];  // forget slice, then gain slice (padded rows)
   __shared__ __align__(16) float gall[M][RANK];  // full down output (BF16 values)
   __shared__ __align__(16) __nv_bfloat16 xs[2 * H];  // bf16([n(h), n(msg)]) of the current token
@@ -84,8 +84,9 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   auto load_x = [&](int m) {
 #pragma unroll
     for (int k = 0; k < XPT; ++k) {
-      xh[k] = hg[size_t(m) * H + k * C::NT + t];
-      xm[k] = mg[size_t(m) * H + k * C::NT + t];
+      const bool in = XFULL || k * C::NT + t < H;
+      xh[k] = in ? hg[size_t(m) * H + k * C::NT + t] : 0.f;
+      xm[k] = in ? mg[size_t(m) * H + k * C::NT + t] : 0.f;
     }
   };
 
@@ -129,8 +130,10 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     const float rh = rsqrtf(ss[0] / H + EPS), rm = rsqrtf(ss[1] / H + EPS);
 #pragma unroll
     for (int k = 0; k < XPT; ++k) {
-      xs[k * C::NT + t] = __float2bfloat16_rn(xh[k] * rh);
-      xs[H + k * C::NT + t] = __float2bfloat16_rn(xm[k] * rm);
+      if (XFULL || k * C::NT + t < H) {
+        xs[k * C::NT + t] = __float2bfloat16_rn(xh[k] * rh);
+        xs[H + k * C::NT + t] = __float2bfloat16_rn(xm[k] * rm);
+      }
     }
     if (m + 1 < M) load_x(m + 1);  // next token's inputs fly during this token's dots
     __syncthreads();
@@ -293,8 +296,31 @@ void message_gates(torch::Tensor h, torch::Tensor msg, torch::Tensor w_down, tor
   }
   // 16-CTA clusters (non-portable, verified schedulable on the RTX 5090): the FP32 forget/gain slices of
   // an 8-CTA split would not fit in shared memory.
+  // On GPUs whose GPCs cannot host a 16-CTA cluster of this kernel (RTX 5080) the BF16 variant runs with
+  // 8-CTA clusters (its slices fit); checked once with the occupancy API.
+  static const bool cl16 = [] {
+    auto k = gates_kernel<16, false, 1>;
+    using C = GateCfg<16, false>;
+    if (cudaFuncSetAttribute(k, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess ||
+        cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return false;
+    }
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(16);
+    cfg.blockDim = dim3(C::NT);
+    cfg.dynamicSmemBytes = C::SMEM;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim.x = 16; attr[0].val.clusterDim.y = 1; attr[0].val.clusterDim.z = 1;
+    cfg.attrs = attr; cfg.numAttrs = 1;
+    int n = 0;
+    if (cudaOccupancyMaxActiveClusters(&n, k, &cfg) != cudaSuccess) { (void)cudaGetLastError(); n = 0; }
+    return n > 0;
+  }();
   if (fg32) launch_gates<16, true>(G, M, a, pdl);
-  else launch_gates<16, false>(G, M, a, pdl);
+  else if (cl16) launch_gates<16, false>(G, M, a, pdl);
+  else launch_gates<8, false>(G, M, a, pdl);
 }
 
 }  // namespace dense

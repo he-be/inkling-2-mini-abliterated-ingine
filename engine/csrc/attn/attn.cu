@@ -75,7 +75,12 @@ constexpr int HQ = 24, HKV = 8, D = 128, DREL = 16, EXT = 1024, WIN = 1024, GQA 
 constexpr int OFF_GATE = 3072, OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OFF_V = 7576, OFF_KDYN = 8600,
               OFF_VDYN = 8632;
 constexpr int R_SLIDING = 8600, R_FULL = 8664;
-constexpr int CS = 16;  // blocks per KV head = cluster size; block r outputs dims [8r, 8r + 8)
+#ifndef INGINE_ATTN_CS
+#define INGINE_ATTN_CS 16
+#endif
+// blocks per KV head = cluster size; block r outputs dims [OD r, OD r + OD). 16 needs a GPC with 16 free SMs
+// (RTX 5090); RTX 5080 GPCs cannot host a 16-block cluster of this kernel, so its build uses 8.
+constexpr int CS = INGINE_ATTN_CS;
 constexpr int OD = D / CS;
 constexpr int MAXM = 8;
 constexpr int U = 2;  // key pairs per warp per register buffer
@@ -977,8 +982,8 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // block `rank` outputs dims 8 rank .. 8 rank + 7 of every row: thread (row, dim) = (tid / 8, tid % 8)
-    if (tid < ROWS * OD) {
-        const int row = tid / OD, dim = rank * OD + tid % OD;
+    for (int it = tid; it < ROWS * OD; it += NT) {  // ROWS * OD > NT when CS = 8 and M > 5
+        const int row = it / OD, dim = rank * OD + it % OD;
         const float* src = p.part + size_t(g * CS) * ROWS * PSTR + row * PSTR;
         float2 ml[CS];
         float o[CS];
@@ -998,7 +1003,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             l += ml[q].y * f;
             a += o[q] * f;
         }
-        const float gate = 1.f / (1.f + expf(-sm[L::GATE + tid]));
+        const float gate = 1.f / (1.f + expf(-sm[L::GATE + it]));
         p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
     }
 
