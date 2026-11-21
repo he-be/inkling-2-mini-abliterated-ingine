@@ -72,7 +72,7 @@ def block_mask(qpos: torch.Tensor, kpos: torch.Tensor, window: int | None) -> Bl
                                     seq_lengths=(T, L))
 
 
-def attend(q, keys, values, qpos, kpos, rel_logits, sink, mask: BlockMask):
+def attend(q, keys, values, qpos, kpos, rel_logits, sink, mask: BlockMask, raw: bool = False):
     """q [T, 24, D] (FP32 holding BF16 values); keys/values [L, 8, D] BF16; qpos [T], kpos [L] int64;
     rel_logits [T, 24, 1024]; sink [T, 24]. Returns [T, 24 * D] FP32."""
     T = q.shape[0]
@@ -92,6 +92,21 @@ def attend(q, keys, values, qpos, kpos, rel_logits, sink, mask: BlockMask):
                          kernel_options=KERNEL_OPTIONS or None)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = tf32
+    if raw:
+        return out[0], lse[0]
     factor = torch.sigmoid(lse[0] - sink.float().T)  # [24, T]
     out = out[0] * factor[..., None]  # [24, T, D]
+    return out.transpose(0, 1).reshape(T, -1)
+
+
+def combine(parts, sink, T):
+    """Merges raw (out [24, T, D], lse [24, T]) results over disjoint key ranges (each row sees at least one key
+    in every part), then applies the sink as `attend` does. Exact up to FP32 rounding."""
+    lses = torch.stack([l for _, l in parts])  # [P, 24, T]
+    top = lses.amax(0)
+    w = torch.exp(lses - top)
+    den = w.sum(0)
+    out = sum(o * wi[..., None] for (o, _), wi in zip(parts, w)) / den[..., None]
+    lse = top + torch.log(den)
+    out = out * torch.sigmoid(lse - sink.float().T)[..., None]
     return out.transpose(0, 1).reshape(T, -1)

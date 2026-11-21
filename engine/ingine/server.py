@@ -55,6 +55,26 @@ class Job:
         self.out: queue.SimpleQueue = queue.SimpleQueue()  # token ids, then _Failure and/or _END
         self.t_submit = time.monotonic()
         self.t_start: float | None = None
+        self.stats = None  # engine Stats when the generator reports them
+        self.done = threading.Event()  # set once the scheduler has closed the generator (stats final)
+
+
+def _timings(st, sampling=None) -> dict | None:
+    """llama.cpp-style timings of one request: prompt = prefill of the new (non-reused) tokens, predicted =
+    the decode loop after the first sampled token."""
+    if st is None or not st.prompt_tokens:
+        return None
+    n_prompt = st.prompt_tokens - st.reused_tokens
+    out = {"cache_n": st.reused_tokens, "prompt_n": n_prompt, "prompt_ms": st.prefill_seconds * 1e3,
+           "prompt_per_second": n_prompt / max(st.prefill_seconds, 1e-9),
+           "predicted_n": st.generated_tokens, "predicted_ms": st.decode_seconds * 1e3,
+           "predicted_per_second": max(st.generated_tokens - 1, 0) / max(st.decode_seconds, 1e-9)}
+    if st.extra:
+        out["spec"] = dict(st.extra)
+    if sampling is not None:  # what the sampler actually used (no min_p / penalties exist in ingine)
+        out["sampling"] = {"temperature": sampling.temperature, "top_p": sampling.top_p, "top_k": sampling.top_k,
+                           "seed": sampling.seed}
+    return out
 
 
 class Scheduler:
@@ -116,6 +136,7 @@ class Scheduler:
             try:
                 self._run(job)
             finally:
+                job.done.set()
                 job.out.put(_END)
                 with self._cv:
                     self.active = None
@@ -124,8 +145,14 @@ class Scheduler:
         if job.cancel.is_set():
             return
         job.t_start = time.monotonic()
-        it = self.generator.generate(job.prompt_ids, job.max_new_tokens, job.sampling, self.stop_ids,
-                                     job.cancel)
+        if getattr(self.generator, "reports_stats", False):  # ingine Engine: per-request timings
+            from .engine import Stats
+            job.stats = Stats()
+            it = self.generator.generate(job.prompt_ids, job.max_new_tokens, job.sampling, self.stop_ids,
+                                         job.cancel, stats=job.stats)
+        else:
+            it = self.generator.generate(job.prompt_ids, job.max_new_tokens, job.sampling, self.stop_ids,
+                                         job.cancel)
         n = 0
         try:
             for tok in it:
@@ -453,6 +480,9 @@ class Handler(BaseHTTPRequestHandler):
 
         usage = {"prompt_tokens": len(prompt_ids), "completion_tokens": parser.num_tokens,
                  "total_tokens": len(prompt_ids) + parser.num_tokens}
+        if job.stats is not None:
+            job.done.wait(timeout=10)  # a stop token ends the stream before the generator is closed
+        timings = _timings(job.stats, job.sampling)
         self._log_done(job, t_first, parser.num_tokens, parser.finish_reason, failure)
         try:
             if stream:
@@ -460,7 +490,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._sse({"error": {"message": failure, "type": "server_error", "param": None,
                                          "code": 500}})
                 else:
-                    self._sse(chunk({}, parser.finish_reason))
+                    last = chunk({}, parser.finish_reason)
+                    if timings:
+                        last["timings"] = timings
+                    self._sse(last)
                     if include_usage:
                         self._sse({"id": job.id, "object": "chat.completion.chunk", "created": created,
                                    "model": app.model_id, "system_fingerprint": None, "choices": [],
@@ -486,7 +519,7 @@ class Handler(BaseHTTPRequestHandler):
                     "system_fingerprint": None,
                     "choices": [{"index": 0, "message": message, "logprobs": None,
                                  "finish_reason": res.finish_reason}],
-                    "usage": usage})
+                    "usage": usage, **({"timings": timings} if timings else {})})
         except (_ClientGone, BrokenPipeError, ConnectionResetError):
             self.close_connection = True
 
@@ -559,6 +592,9 @@ def main(argv: list[str] | None = None) -> None:
                      "(read by the kernels over PCIe), e.g. 20-23")
     eng.add_argument("--host-embed", action="store_true", help="embedding table in mapped page-locked RAM")
     eng.add_argument("--prefill-group", type=int, default=128, help="experts decoded to BF16 at a time in prefill")
+    eng.add_argument("--prefill-chunk", type=int, default=2048, help="prompt tokens per prefill call")
+    eng.add_argument("--full-segment", type=int, default=1 << 30,
+                     help="prefill: full-attention keys per Flex call (smaller = less transient VRAM at long context)")
     ap.add_argument("--fake-delay", type=float, default=0.02, help="seconds per fake token")
     ap.add_argument("--model-id", help="model name reported by the API (default: generator.model_id)")
     ap.add_argument("--max-queue", type=int, default=4, help="requests allowed to wait behind the running one")
@@ -576,7 +612,8 @@ def main(argv: list[str] | None = None) -> None:
         generator = Engine(args.model_dir, max_ctx=args.max_ctx, ablation=args.ablation, backend=args.backend,
                            dense_fp8=args.dense_fp8, spec=args.spec, spec_threshold=args.spec_threshold,
                            kv_fp8=args.kv_fp8, host_experts=args.host_experts, host_embed=args.host_embed,
-                           prefill_group=args.prefill_group)
+                           prefill_group=args.prefill_group, prefill_chunk=args.prefill_chunk,
+                           full_segment=args.full_segment)
     else:
         mod, _, attr = args.generator.partition(":")
         generator = getattr(importlib.import_module(mod), attr or "create")(args.model_dir, fmt.tokenizer)

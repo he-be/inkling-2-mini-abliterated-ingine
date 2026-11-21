@@ -221,6 +221,7 @@ class Model:
         self.device = device
         self._scratch13 = self._scratch2 = None  # BF16 expert scratch for grouped prefill (lazy)
         self.prefill_group = W.EXPERTS  # experts per scratch fill (128 = 2 GB, the original)
+        self.full_segment = 1 << 30  # prefill full-attention keys per Flex call (default: one call, the original)
         self.capture_taps = False
         self.last_taps: torch.Tensor | None = None
 
@@ -461,6 +462,22 @@ class Model:
                 st.v_full[fi, pos0:pos0 + T] = st.full_store(vv)
                 # only the filled prefix reaches Flex (which widens it to FP32): memory and time follow the
                 # context, not max_ctx; the chunk's own keys are read back at the cache precision
+                if pos0 > self.full_segment:
+                    # long context: Flex widens the keys/values to FP32 (8 KiB per position, 2 GiB at 256K);
+                    # run it over segments of the cache and merge by log-sum-exp. Past segments are fully
+                    # visible; the last one holds the chunk's own keys, so no row is empty.
+                    S = self.full_segment
+                    starts = list(range(0, pos0, S))
+                    bounds = [(a, a + S) for a in starts[:-1]] + [(starts[-1], pos0 + T)]
+                    parts = []
+                    for a, b in bounds:
+                        kp = torch.arange(a, b, device=self.device)
+                        key = ("full", a, b)
+                        if key not in masks:
+                            masks[key] = flex.block_mask(positions, kp, None)
+                        parts.append(flex.attend(q, st.k_full[fi, a:b], st.v_full[fi, a:b], positions, kp,
+                                                 rel_logits, sink, masks[key], raw=True))
+                    return flex.combine(parts, sink, T)
                 keys, values = st.k_full[fi, :pos0 + T], st.v_full[fi, :pos0 + T]
                 kpos = torch.arange(pos0 + T, device=self.device)
                 if "full" not in masks:

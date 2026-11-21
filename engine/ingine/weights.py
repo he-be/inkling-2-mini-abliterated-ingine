@@ -193,9 +193,9 @@ def host_mapped(t: torch.Tensor) -> torch.Tensor:
 
 
 def parse_layers(spec: str | None) -> set[int]:
-    """"20-23,0" -> {0, 20, 21, 22, 23}."""
+    """"20-23,0" -> {0, 20, 21, 22, 23} ("+" also separates: cmd.exe splits arguments at commas)."""
     out: set[int] = set()
-    for part in (spec or "").split(","):
+    for part in (spec or "").replace("+", ",").split(","):
         part = part.strip()
         if not part:
             continue

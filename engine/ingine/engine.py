@@ -36,7 +36,8 @@ class Engine:
     def __init__(self, model_dir: str | Path, max_ctx: int = 65536, ablation: str | None = None,
                  backend: str = "torch", graph: bool = True, prefill_chunk: int = 2048, dense_fp8: bool = False,
                  spec: bool = False, spec_threshold: float = 0.8, kv_fp8: bool = False,
-                 host_experts: str | None = None, host_embed: bool = False, prefill_group: int = W.EXPERTS):
+                 host_experts: str | None = None, host_embed: bool = False, prefill_group: int = W.EXPERTS,
+                 full_segment: int = 1 << 30):
         from transformers import AutoTokenizer
         self.model_dir = Path(model_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
@@ -47,6 +48,7 @@ class Engine:
         self.abl = M.Ablation.load(ablation) if ablation else M.Ablation.none()
         self.model = M.Model(self.weights, self.abl)
         self.model.prefill_group = prefill_group
+        self.model.full_segment = full_segment
         self.state = M.State(max_ctx, kv_fp8=kv_fp8)
         self.max_model_len = max_ctx
         self.max_ctx = max_ctx
@@ -87,6 +89,7 @@ class Engine:
         self._prefill(list(range(1000, 1000 + min(2 * prefill_chunk + 100, max_ctx - 8))))
         self.tokens_in_state = []
         self.load_seconds = time.time() - t
+        self.reports_stats = True  # generate(..., stats=) fills prefill/decode timings (server: "timings")
 
     def _conv_states(self):
         st = self.state
@@ -199,21 +202,23 @@ class Engine:
             token = self._sample(logits, sampling, gen)
             stats.prefill_seconds = time.time() - t
             t = time.time()
-            if self.drafter is not None:
-                yield from self._generate_spec(token, max_new_tokens, sampling, stop_ids, cancel, stats, gen)
-            else:
-                pos = len(prompt_ids)
-                for i in range(max_new_tokens):
-                    stats.generated_tokens = i + 1
-                    yield token
-                    if token in stop_ids or i + 1 == max_new_tokens or (cancel is not None and cancel.is_set()):
-                        break
-                    logits = self._decode_logits(token, pos)
-                    self.tokens_in_state.append(token)
-                    pos += 1
-                    token = self._sample(logits, sampling, gen)
-            torch.cuda.synchronize()
-            stats.decode_seconds = time.time() - t
+            try:  # the consumer may close the iterator right after a stop token: record the time anyway
+                if self.drafter is not None:
+                    yield from self._generate_spec(token, max_new_tokens, sampling, stop_ids, cancel, stats, gen)
+                else:
+                    pos = len(prompt_ids)
+                    for i in range(max_new_tokens):
+                        stats.generated_tokens = i + 1
+                        yield token
+                        if token in stop_ids or i + 1 == max_new_tokens or (cancel is not None and cancel.is_set()):
+                            break
+                        logits = self._decode_logits(token, pos)
+                        self.tokens_in_state.append(token)
+                        pos += 1
+                        token = self._sample(logits, sampling, gen)
+            finally:
+                torch.cuda.synchronize()
+                stats.decode_seconds = time.time() - t
 
     # ---- DSpark speculative decoding ------------------------------------------------------------------
 
