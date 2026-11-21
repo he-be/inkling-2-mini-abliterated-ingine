@@ -25,8 +25,10 @@ __device__ __forceinline__ void store_cache(void* cache, size_t at, float x, boo
 }
 // 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one cvt.rn.bf16x2.e4m3x2 on sm_120a (cuda_fp8.hpp)
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
-  const __nv_bfloat162_raw b = __nv_cvt_fp8x2_to_bf162raw(static_cast<__nv_fp8x2_storage_t>(u & 0xffffu), __NV_E4M3);
-  return uint32_t(b.x) | (uint32_t(b.y) << 16);
+  // Inline PTX (as in dense/gemv.cu): CUDA 13.3's cuda_fp8.hpp has no __nv_cvt_fp8x2_to_bf162raw.
+  uint32_t r;
+  asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u & 0xffffu)));
+  return r;
 }
 
 // 8 BF16 values (one uint4) -> 8 floats.

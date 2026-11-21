@@ -64,6 +64,7 @@ struct GemmArgs {
   const uint16_t* a = nullptr;      // activations (bf16)
   MoeWork w;                        // tiles and pair lists
   uint16_t* out = nullptr;
+  int e_lo = 0, e_hi = 128;         // experts run (codes/scales start at e_lo)
 };
 
 __device__ __forceinline__ void cp_async4(void* smem_dst, const void* gmem_src) {
@@ -113,9 +114,10 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   if (tile_idx >= *g.w.tiles_n) return;
   const int4 tile = g.w.tiles[tile_idx];
   const int e = tile.x, pb = tile.y, n = tile.z;
+  if (e < g.e_lo || e >= g.e_hi) return;
   const int n0 = (blockIdx.x % NTILES_N) * TN;
-  const uint8_t* code_tile = g.codes + (int64_t(e) * NE + n0) * C::CODE_ROW;
-  const uint8_t* scale_tile = g.scales + (int64_t(e) * NE + n0) * C::SCALE_ROW;
+  const uint8_t* code_tile = g.codes + (int64_t(e - g.e_lo) * NE + n0) * C::CODE_ROW;
+  const uint8_t* scale_tile = g.scales + (int64_t(e - g.e_lo) * NE + n0) * C::SCALE_ROW;
   if (tid < 16) lut[tid] = kE2M1[tid];
 
   // activation rows of this thread's cp.async chunks: rows tid / 8 + 32 i, chunk tid % 8
@@ -309,14 +311,16 @@ GemmArgs expert_args(const void* codes, const void* scales, const float* factors
 
 void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
                  cudaStream_t stream) {
-  const GemmArgs g = expert_args(e.w13, e.w13_scale, e.w13_factor, x, w, act);
+  GemmArgs g = expert_args(e.w13, e.w13_scale, e.w13_factor, x, w, act);
+  g.e_lo = e.e_lo, g.e_hi = e.e_hi;
   if (e.fmt == 0) launch_rows<FMT_NVFP4, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
   else launch_rows<FMT_MXFP8, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
 }
 
 void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWork& w, __nv_bfloat16* down,
               cudaStream_t stream) {
-  const GemmArgs g = expert_args(e.w2, e.w2_scale, e.w2_factor, act, w, down);
+  GemmArgs g = expert_args(e.w2, e.w2_scale, e.w2_factor, act, w, down);
+  g.e_lo = e.e_lo, g.e_hi = e.e_hi;
   if (e.fmt == 0) launch_rows<FMT_NVFP4, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
   else launch_rows<FMT_MXFP8, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
 }

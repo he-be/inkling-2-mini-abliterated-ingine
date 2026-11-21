@@ -43,6 +43,26 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
   set(CMAKE_JOB_POOL_LINK ingine_link)
 endif()
 
+if(MSVC)
+  # Windows (MSVC host compiler): UTF-8 sources, standard C++ behaviour, lean <windows.h>.
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
+    $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
+    $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc>)
+endif()
+
+# Decode attention cluster size (blocks per KV head): 16 on the RTX 5090; 8 where a GPC cannot host 16 (RTX 5080).
+set(INGINE_ATTN_CS 16 CACHE STRING "decode attention cluster size (16 or 8)")
+add_compile_definitions(INGINE_ATTN_CS=${INGINE_ATTN_CS})
+
 include(cmake/Dependencies.cmake)
 
 add_subdirectory(third_party)

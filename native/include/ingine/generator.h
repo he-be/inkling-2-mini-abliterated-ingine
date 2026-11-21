@@ -97,6 +97,10 @@ struct RuntimeOptions {
   int park_mb = -1;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
+  // Memory-constrained GPUs (RTX 5080 16 GB): layers whose routed experts (codes + block scales) live in
+  // mapped page-locked host memory, read by the kernels over PCIe; host_embed: the token table too.
+  std::vector<int> host_layers;
+  bool host_embed = false;
 };
 
 class Generator {

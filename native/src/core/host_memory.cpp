@@ -12,7 +12,11 @@
 #include <string>
 #include <utility>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#endif
 
 namespace ingine {
 namespace {
@@ -26,6 +30,17 @@ std::size_t align_huge(std::size_t bytes) {
 HostRegion::HostRegion(std::size_t bytes) {
     if (bytes == 0) { throw std::invalid_argument("HostRegion size must be nonzero"); }
     const std::size_t size = align_huge(bytes);
+#ifdef _WIN32
+    // Windows: committed pages from VirtualAlloc (64 KiB aligned; no transparent huge pages).
+    void* raw = ::VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!raw) {
+        throw std::runtime_error("HostRegion: VirtualAlloc of " + std::to_string(size) +
+                                 " bytes failed: error " + std::to_string(::GetLastError()));
+    }
+    data_ = reinterpret_cast<std::byte*>(raw);
+    size_ = size;
+}
+#else
     // Over-map by one huge page so the region can start on a 2 MiB boundary, then trim.
     const std::size_t span = size + kHugePageBytes;
     void* raw = ::mmap(nullptr, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
@@ -46,6 +61,7 @@ HostRegion::HostRegion(std::size_t bytes) {
         spdlog::warn("HostRegion: madvise(MADV_HUGEPAGE) failed: {}", std::strerror(errno));
     }
 }
+#endif
 
 HostRegion::~HostRegion() { release(); }
 
@@ -106,7 +122,11 @@ void HostRegion::unregister() noexcept {
 
 void HostRegion::release() noexcept {
     unregister();
+#ifdef _WIN32
+    if (data_) { ::VirtualFree(data_, 0, MEM_RELEASE); }
+#else
     if (data_) { ::munmap(data_, size_); }
+#endif
     data_ = nullptr;
     size_ = 0;
 }
@@ -161,6 +181,11 @@ void MappedHostBuffer::release() noexcept {
 }
 
 std::uint64_t mem_available_bytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX st{};
+    st.dwLength = sizeof(st);
+    return ::GlobalMemoryStatusEx(&st) ? std::uint64_t(st.ullAvailPhys) : 0;
+#endif
     std::ifstream in("/proc/meminfo");
     std::string key;
     std::uint64_t value = 0;

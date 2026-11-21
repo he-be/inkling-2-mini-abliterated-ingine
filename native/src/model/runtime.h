@@ -37,7 +37,8 @@ namespace ingine::model {
 
 // ---- loading (weights.load + FastDecoder._concat_projections/_stack_layer_params/_fp8_dense,
 // model.Ablation.load/none, model.State)
-Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cudaStream_t stream);
+Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cudaStream_t stream,
+                     const std::vector<int>& host_layers = {}, bool host_embed = false);
 // One layer as weights.load_layer (+ the decoder's derived tensors), for kernel tests; owns its memory.
 Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
                  std::vector<DeviceBuffer>& storage);

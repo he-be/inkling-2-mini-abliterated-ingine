@@ -82,10 +82,68 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   fpre_ = reinterpret_cast<float*>(down_), gpre_ = fpre_ + C * H;
   wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
+  // staging for host-resident experts: room for kStageExperts of the largest host layer's w13 (or w2)
+  for (const Layer& layer : w.layers) {
+    const Experts& ex = layer.experts;
+    if (!ex.host) continue;
+    for (const Tensor* t : {&ex.w13, &ex.w2})
+      stage_code_bytes_ = std::max(stage_code_bytes_, std::size_t(t->nb[3] * t->ne[3]) / EXPERTS * kStageExperts);
+    for (const Tensor* t : {&ex.w13_scale, &ex.w2_scale})
+      stage_scale_bytes_ = std::max(stage_scale_bytes_, std::size_t(t->nb[3] * t->ne[3]) / EXPERTS * kStageExperts);
+  }
+  if (stage_code_bytes_) {
+    for (int b = 0; b < 2; ++b) {
+      stage_codes_[b] = static_cast<std::uint8_t*>(alloc(stage_code_bytes_));
+      stage_scales_[b] = static_cast<std::uint8_t*>(alloc(stage_scale_bytes_));
+      CUDA_CHECK(cudaEventCreateWithFlags(&copied_[b], cudaEventDisableTiming));
+      CUDA_CHECK(cudaEventCreateWithFlags(&used_[b], cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
+  }
   for (auto& b : storage_) b.fill(0);  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
 }
 
-Prefiller::~Prefiller() = default;
+Prefiller::~Prefiller() {
+  for (int b = 0; b < 2; ++b) {
+    if (copied_[b]) cudaEventDestroy(copied_[b]);
+    if (used_[b]) cudaEventDestroy(used_[b]);
+  }
+  if (copy_stream_) cudaStreamDestroy(copy_stream_);
+}
+
+// The grouped GEMM of a host-resident layer: kStageExperts experts at a time are copied (DMA, full PCIe rate)
+// into one of two staging buffers on copy_stream_; the GEMM over that group's tiles runs on stream_ (tiles of
+// other experts exit at once). Same results as the direct path: the same kernel over the same bytes.
+void Prefiller::staged_experts(const Experts& ex, bool up, const __nv_bfloat16* in, int T, const void* work_p,
+                               __nv_bfloat16* out) {
+  const pk::MoeWork& work = *static_cast<const pk::MoeWork*>(work_p);
+  const Tensor& codes = up ? ex.w13 : ex.w2;
+  const Tensor& scales = up ? ex.w13_scale : ex.w2_scale;
+  const std::size_t cs = std::size_t(codes.nb[3] * codes.ne[3]) / EXPERTS;  // bytes per expert
+  const std::size_t ss = std::size_t(scales.nb[3] * scales.ne[3]) / EXPERTS;
+  const auto* csrc = static_cast<const std::uint8_t*>(codes.data);
+  const auto* ssrc = static_cast<const std::uint8_t*>(scales.data);
+  for (int g0 = 0, i = 0; g0 < EXPERTS; g0 += kStageExperts, ++i) {
+    const int b = i & 1, n = std::min(kStageExperts, EXPERTS - g0);
+    // buffer b is free once the GEMM that last read it (this call's or the previous call's) is done
+    CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, used_[b]));
+    CUDA_CHECK(cudaMemcpyAsync(stage_codes_[b], csrc + g0 * cs, n * cs, cudaMemcpyDefault, copy_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(stage_scales_[b], ssrc + g0 * ss, n * ss, cudaMemcpyDefault, copy_stream_));
+    CUDA_CHECK(cudaEventRecord(copied_[b], copy_stream_));
+    CUDA_CHECK(cudaStreamWaitEvent(stream_, copied_[b]));
+    pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, nullptr, nullptr, f32p(ex.w13_factor), nullptr, nullptr,
+                      f32p(ex.w2_factor)};
+    me.e_lo = g0, me.e_hi = g0 + n;
+    if (up) {
+      me.w13 = stage_codes_[b], me.w13_scale = stage_scales_[b];
+      pk::moe_gate_up(me, in, T, work, out, stream_);
+    } else {
+      me.w2 = stage_codes_[b], me.w2_scale = stage_scales_[b];
+      pk::moe_down(me, in, T, work, out, stream_);
+    }
+    CUDA_CHECK(cudaEventRecord(used_[b], stream_));
+  }
+}
 
 std::size_t Prefiller::device_bytes() const {
   std::size_t n = 0;
@@ -312,8 +370,13 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const Experts& ex = layer.experts;
     const pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
                             f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
-    pk::moe_gate_up(me, xm_, T, work, act_, s);
-    pk::moe_down(me, act_, T, work, down_, s);
+    if (ex.host) {
+      staged_experts(ex, true, xm_, T, &work, act_);
+      staged_experts(ex, false, act_, T, &work, down_);
+    } else {
+      pk::moe_gate_up(me, xm_, T, work, act_, s);
+      pk::moe_down(me, act_, T, work, down_, s);
+    }
     pk::moe_combine(down_, wts_, T, moe_sum_, s);
     pk::static_conv(moe_sum_, H, T, H, f32p(layer.mlp_conv), st.conv_mlp_at(v), y2_, s);
     pk::conv_state_update(st.conv_mlp_at(v), moe_sum_, H, T, H, s);
