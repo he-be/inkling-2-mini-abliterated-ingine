@@ -445,9 +445,10 @@ class Model:
     # ---- prefill ------------------------------------------------------------------------------------
 
     @torch.inference_mode()
-    def prefill(self, st: State, ids: torch.Tensor, all_logits: bool = False):
+    def prefill(self, st: State, ids: torch.Tensor, all_logits: bool = False, inject=None):
         """Runs prompt tokens `ids` [T] after the `st.length` tokens already in `st`. Returns logits of the
-        last token ([V]) or of every token ([T, V])."""
+        last token ([V]) or of every token ([T, V]). `inject`: (offset, rows [n, H]) pairs whose rows replace
+        the input embeddings from offset on (image features: BF16-rounded, embed_norm not applied)."""
         T = ids.shape[0]
         pos0 = st.length
         if pos0 + T > st.max_ctx:
@@ -498,7 +499,10 @@ class Model:
                 st.ring_pos[ri, slots] = positions[-n:]
             return flex.attend(q, keys, values, positions, kpos, rel_logits, sink, mask)
 
-        h = self._run(self.embed(ids), st, attend, positions)
+        x = self.embed(ids)
+        for off, r in inject or ():
+            x[off:off + r.shape[0]] = r.to(torch.bfloat16).float()
+        h = self._run(x, st, attend, positions)
         st.length = pos0 + T
         return self.logits(h) if all_logits else self.logits(h[-1:])[0]
 

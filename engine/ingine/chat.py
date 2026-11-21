@@ -28,7 +28,7 @@ import json
 import re
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
 
 MESSAGE_MODEL = "<|message_model|>"
@@ -126,6 +126,9 @@ class RenderedPrompt:
     ids: list[int]  # full prompt, prefill included
     text: str
     prefill_ids: list[int]  # tail of ``ids`` the model would otherwise have generated
+    # (first placeholder index in ``ids``, vision.Image) per image, in prompt order; the placeholder runs
+    # are already expanded to the image's token count
+    images: list = field(default_factory=list)
 
 
 def normalize_effort(effort: Any) -> str | float | None:
@@ -168,6 +171,9 @@ def _normalize_tool_call(tc: Any) -> dict:
     return {**tc, "function": fn}
 
 
+IMAGE_PARTS = ("image_url", "image", "input_image")
+
+
 def normalize_messages(messages: Any) -> list[dict]:
     """OpenAI chat messages -> the shapes the checkpoint template expects."""
     if not isinstance(messages, list) or not messages:
@@ -185,11 +191,23 @@ def normalize_messages(messages: Any) -> list[dict]:
         if content is None:
             m.pop("content", None)
         elif isinstance(content, list):
+            parts = []
             for part in content:
-                if isinstance(part, dict) and part.get("type") not in (None, "text", "input_text"):
-                    raise ChatError(f"unsupported content part type {part.get('type')!r} (text only)")
                 if not isinstance(part, (str, dict)):
                     raise ChatError("content parts must be strings or objects")
+                if isinstance(part, dict) and part.get("type") in IMAGE_PARTS:
+                    if m["role"] not in ("user", "tool"):
+                        raise ChatError("image content is only supported in user and tool messages")
+                    url = part.get("image_url", part.get("image"))
+                    if isinstance(url, dict):
+                        url = url.get("url")
+                    if not isinstance(url, str):
+                        raise ChatError("image part needs an image_url (data: URL, base64)")
+                    part = {"type": "image", "_url": url}
+                elif isinstance(part, dict) and part.get("type") not in (None, "text", "input_text"):
+                    raise ChatError(f"unsupported content part type {part.get('type')!r} (text and images only)")
+                parts.append(part)
+            m["content"] = parts
         elif not isinstance(content, str):
             raise ChatError("message content must be a string, a list of parts, or null")
         if m["role"] == "assistant":
@@ -209,8 +227,9 @@ def normalize_messages(messages: Any) -> list[dict]:
 class ChatFormat:
     """Tokenizer-bound renderer and parser factory."""
 
-    def __init__(self, tokenizer: Any):
+    def __init__(self, tokenizer: Any, vision: bool = False):
         self.tokenizer = tokenizer
+        self.vision = vision  # accept image parts (the generator encodes them)
         self._lock = threading.Lock()
         tid = tokenizer.convert_tokens_to_ids
         self.ids = {s: tid(s) for s in (
@@ -252,7 +271,32 @@ class ChatFormat:
             prefill = list(self.no_thinking_prefill)
         with self._lock:
             ids = self.tokenizer.encode(text, add_special_tokens=False)
-        return RenderedPrompt(ids=ids, text=text, prefill_ids=prefill)
+        urls = [p["_url"] for m in msgs if isinstance(m.get("content"), list)
+                for p in m["content"] if isinstance(p, dict) and p.get("type") == "image"]
+        images = []
+        if urls:
+            if not self.vision:
+                raise ChatError("this server was started without image support", "messages")
+            from . import vision
+            ph = self.tokenizer.convert_tokens_to_ids(vision.PLACEHOLDER)
+            slots = [i for i, t in enumerate(ids) if t == ph]
+            if len(slots) != len(urls):
+                raise ChatError(f"{len(urls)} images but {len(slots)} image placeholders in the prompt")
+            out = []
+            prev = 0
+            for slot, url in zip(slots, urls):
+                try:
+                    img = vision.preprocess(vision.decode_data_url(url))
+                except ValueError as e:
+                    raise ChatError(str(e), "messages") from None
+                except Exception as e:  # undecodable image data
+                    raise ChatError(f"could not read image: {type(e).__name__}: {e}", "messages") from None
+                out += ids[prev:slot]
+                images.append((len(out), img))
+                out += [ph] * img.n_tokens
+                prev = slot + 1
+            ids = out + ids[prev:]
+        return RenderedPrompt(ids=ids, text=text, prefill_ids=prefill, images=images)
 
     def parser(self, prefill_ids: Iterable[int] = (), stop: Sequence[str] | None = None,
                id_factory: Callable[[], str] | None = None) -> "StreamParser":

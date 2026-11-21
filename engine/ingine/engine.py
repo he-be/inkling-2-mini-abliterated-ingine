@@ -37,7 +37,7 @@ class Engine:
                  backend: str = "torch", graph: bool = True, prefill_chunk: int = 2048, dense_fp8: bool = False,
                  spec: bool = False, spec_threshold: float = 0.8, kv_fp8: bool = False,
                  host_experts: str | None = None, host_embed: bool = False, prefill_group: int = W.EXPERTS,
-                 full_segment: int = 1 << 30):
+                 full_segment: int = 1 << 30, vision: str = "off"):
         from transformers import AutoTokenizer
         self.model_dir = Path(model_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
@@ -49,6 +49,10 @@ class Engine:
         self.model = M.Model(self.weights, self.abl)
         self.model.prefill_group = prefill_group
         self.model.full_segment = full_segment
+        self.vision = None
+        if vision != "off":
+            from .vision import VisionTower
+            self.vision = VisionTower(self.model_dir, placement=vision)
         self.state = M.State(max_ctx, kv_fp8=kv_fp8)
         self.max_model_len = max_ctx
         self.max_ctx = max_ctx
@@ -154,11 +158,23 @@ class Engine:
             return int(logits.argmax())
         return int(torch.multinomial(self._probs(logits, sampling), 1, generator=gen))
 
-    def _prefill(self, ids: list[int]):
+    @staticmethod
+    def _keys(ids: list[int], images) -> list:
+        """Prompt identity for prefix reuse: image placeholder runs become (digest, row) keys, since the
+        placeholder token is the same for every image."""
+        keys = list(ids)
+        for start, img in images or ():
+            for j in range(img.n_tokens):
+                keys[start + j] = ("img", img.digest, j)
+        return keys
+
+    def _prefill(self, ids: list[int], images=None):
         """Brings the state to `ids` (reusing a matching prefix) and returns (last logits, reused tokens).
+        `images`: (start, vision.Image) pairs whose rows replace the placeholder embeddings from start on.
         With a drafter, every prompt row's features also become draft context."""
         prev = self.tokens_in_state
-        reusable = 0 < len(prev) < len(ids) and ids[:len(prev)] == prev
+        keys = self._keys(ids, images)
+        reusable = 0 < len(prev) < len(ids) and keys[:len(prev)] == prev
         if self.drafter is not None and self.drafter.length != len(prev):
             reusable = False  # the drafter missed rows (a non-speculative request ran in between)
         if reusable:
@@ -171,20 +187,30 @@ class Engine:
             self.tokens_in_state = []
             start = 0
         logits = None
+        rows = []  # (start, [n, H] rows) of the images that reach past the reused prefix
+        for s0, img in images or ():
+            if s0 + img.n_tokens > start:
+                if self.vision is None:
+                    raise ValueError("image input needs the engine started with vision")
+                rows.append((s0, self.vision.encode(img)))
         with torch.inference_mode():
             for s in range(start, len(ids), self.prefill_chunk):
-                chunk = torch.tensor(ids[s:s + self.prefill_chunk], device="cuda")
-                logits = self.model.prefill(self.state, chunk)
+                e = min(s + self.prefill_chunk, len(ids))
+                chunk = torch.tensor(ids[s:e], device="cuda")
+                inject = [(max(s0, s) - s, r[max(s0, s) - s0:e - s0]) for s0, r in rows
+                          if s0 < e and s0 + r.shape[0] > s]
+                logits = self.model.prefill(self.state, chunk, inject=inject)
                 if self.drafter is not None:
                     self.drafter.commit(self.model.last_taps, s)
         # Prefill transients grow with the context (FP32 copies of the full-attention keys and values): hand
         # them back to the driver so the resident footprint between requests is the persistent set.
         torch.cuda.empty_cache()
-        self.tokens_in_state = list(ids)
+        self.tokens_in_state = keys
         return logits, start
 
     def generate(self, prompt_ids: list[int], max_new_tokens: int, sampling: Sampling, stop_ids: set[int],
-                 cancel: threading.Event | None = None, stats: Stats | None = None) -> Iterator[int]:
+                 cancel: threading.Event | None = None, stats: Stats | None = None,
+                 images=None) -> Iterator[int]:
         reserve = max(self.verify_bufs) if self.drafter is not None else 0  # a verify call writes m positions
         if len(prompt_ids) + max_new_tokens + reserve > self.max_ctx:
             max_new_tokens = self.max_ctx - len(prompt_ids) - reserve
@@ -197,7 +223,7 @@ class Engine:
             gen.manual_seed(sampling.seed)
         with self.lock:
             t = time.time()
-            logits, reused = self._prefill(prompt_ids)
+            logits, reused = self._prefill(prompt_ids, images)
             stats.prompt_tokens, stats.reused_tokens = len(prompt_ids), reused
             token = self._sample(logits, sampling, gen)
             stats.prefill_seconds = time.time() - t

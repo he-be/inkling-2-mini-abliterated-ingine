@@ -14,3 +14,5 @@ results/serve-*.log
 /work
 .venv/
 engine/build/
+tools/mtmd_embd/*.exe
+tools/mtmd_embd/*.obj

@@ -57,6 +57,7 @@ class Job:
         self.t_start: float | None = None
         self.stats = None  # engine Stats when the generator reports them
         self.done = threading.Event()  # set once the scheduler has closed the generator (stats final)
+        self.images: list = []  # (start, vision.Image) per image in prompt_ids
 
 
 def _timings(st, sampling=None) -> dict | None:
@@ -148,8 +149,9 @@ class Scheduler:
         if getattr(self.generator, "reports_stats", False):  # ingine Engine: per-request timings
             from .engine import Stats
             job.stats = Stats()
+            extra = {"images": job.images} if job.images else {}
             it = self.generator.generate(job.prompt_ids, job.max_new_tokens, job.sampling, self.stop_ids,
-                                         job.cancel, stats=job.stats)
+                                         job.cancel, stats=job.stats, **extra)
         else:
             it = self.generator.generate(job.prompt_ids, job.max_new_tokens, job.sampling, self.stop_ids,
                                          job.cancel)
@@ -418,14 +420,15 @@ class Handler(BaseHTTPRequestHandler):
         opts = body.get("stream_options") or {}
         if not isinstance(opts, dict):
             raise _BadRequest("'stream_options' must be an object", "stream_options")
-        return {"prompt_ids": prompt.ids, "prefill_ids": prompt.prefill_ids,
+        return {"prompt_ids": prompt.ids, "prefill_ids": prompt.prefill_ids, "images": prompt.images,
                 "max_new_tokens": min(max_tokens or room, room), "sampling": sampling, "stop": stop or [],
                 "stream": stream, "include_usage": bool(opts.get("include_usage"))}
 
-    def _complete(self, prompt_ids: list[int], prefill_ids: list[int], max_new_tokens: int,
+    def _complete(self, prompt_ids: list[int], prefill_ids: list[int], images: list, max_new_tokens: int,
                   sampling: Sampling, stop: list[str], stream: bool, include_usage: bool) -> None:
         app = self.app
         job = Job(prompt_ids, max_new_tokens, sampling)
+        job.images = images
         if not app.scheduler.submit(job):
             self._send_error(503, "server busy: request queue is full", headers={"Retry-After": "1"})
             return
@@ -591,6 +594,8 @@ def main(argv: list[str] | None = None) -> None:
     eng.add_argument("--host-experts", help="layers whose routed experts stay in mapped page-locked RAM "
                      "(read by the kernels over PCIe), e.g. 20-23")
     eng.add_argument("--host-embed", action="store_true", help="embedding table in mapped page-locked RAM")
+    eng.add_argument("--vision", choices=("off", "host", "gpu"), default="off",
+                     help="image input: vision tower weights in page-locked RAM (staged per block) or in VRAM")
     eng.add_argument("--prefill-group", type=int, default=128, help="experts decoded to BF16 at a time in prefill")
     eng.add_argument("--prefill-chunk", type=int, default=2048, help="prompt tokens per prefill call")
     eng.add_argument("--full-segment", type=int, default=1 << 30,
@@ -613,7 +618,8 @@ def main(argv: list[str] | None = None) -> None:
                            dense_fp8=args.dense_fp8, spec=args.spec, spec_threshold=args.spec_threshold,
                            kv_fp8=args.kv_fp8, host_experts=args.host_experts, host_embed=args.host_embed,
                            prefill_group=args.prefill_group, prefill_chunk=args.prefill_chunk,
-                           full_segment=args.full_segment)
+                           full_segment=args.full_segment, vision=args.vision)
+        fmt.vision = generator.vision is not None
     else:
         mod, _, attr = args.generator.partition(":")
         generator = getattr(importlib.import_module(mod), attr or "create")(args.model_dir, fmt.tokenizer)
