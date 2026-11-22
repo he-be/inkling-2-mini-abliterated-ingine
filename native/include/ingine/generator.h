@@ -2,6 +2,7 @@
 // scheduler, the HTTP layer and their tests build without the model; ingine_model implements make_generator.
 #pragma once
 
+#include "ingine/image.h"
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -23,6 +24,9 @@ struct Sampling {
   // usual and then takes the forced token; speculative decoding accepts a draft iff it equals the forced token
   // and continues with the forced token after the accepted run. Fills GenerateStats::spec_trace.
   std::span<const int32_t> forced;
+  // Image input (Windows/16 GB fork): images whose rows replace the placeholder embeddings from their start on
+  // (ChatFormat expands each placeholder to the image's token count). Needs RuntimeOptions::vision.
+  std::vector<ImageInput> images;
 };
 
 // How the prompt reused the state of earlier requests (reused_tokens were not prefilled again).
@@ -72,6 +76,7 @@ struct RuntimeOptions {
   // mapped page-locked host memory, read by the kernels over PCIe; host_embed: the token table too.
   std::vector<int> host_layers;
   bool host_embed = false;
+  bool vision = false;  // load the vision tower (image input)
 };
 
 class Generator {

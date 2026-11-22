@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace ingine::kernels::prefill {
@@ -34,7 +35,14 @@ class Prefiller {
   Prefiller(const Prefiller&) = delete;
   Prefiller& operator=(const Prefiller&) = delete;
 
-  void run(State& state, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps);
+  // inject: rows [row, row + n) of the chunk take `rows` (device fp32 [n, H], BF16 values) as their input
+  // embedding instead of the token's (image features; embed_norm is not applied to them)
+  struct Inject {
+    int row = 0, n = 0;
+    const float* rows = nullptr;
+  };
+  void run(State& state, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
+           std::span<const Inject> inject = {});
 
   int max_chunk() const { return max_chunk_; }
   std::size_t device_bytes() const;  // scratch held by this object

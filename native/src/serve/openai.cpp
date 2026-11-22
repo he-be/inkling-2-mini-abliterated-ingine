@@ -156,6 +156,7 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   req.max_new_tokens = int(std::min(max_tokens.value_or(room), room));
   req.prompt_ids = std::move(prompt.ids);
   req.prefill_ids = std::move(prompt.prefill_ids);
+  req.sampling.images = std::move(prompt.images);
   return req;
 }
 

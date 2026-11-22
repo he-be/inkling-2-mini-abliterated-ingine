@@ -17,3 +17,4 @@ results/serve-*.log
 /native/build*
 native/build-win/
 native/build-win.log
+native/dist/

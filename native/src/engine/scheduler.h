@@ -48,6 +48,9 @@ class Job {
 
   // Waits up to `timeout` for output, then returns everything available (empty on timeout).
   JobBatch take(Clock::duration timeout);
+  // The generator's statistics, once generate() has returned (waits up to `timeout`; nullopt on failure or
+  // timeout). The response's "timings" (fork) come from them.
+  std::optional<model::GenerateStats> wait_stats(Clock::duration timeout) const;
 
  private:
   friend class Scheduler;
@@ -63,6 +66,9 @@ class Job {
   std::optional<std::string> failure_;
   bool end_ = false;
   std::optional<Clock::time_point> t_start_;
+  std::optional<model::GenerateStats> stats_;
+  bool done_ = false;
+  mutable std::condition_variable done_cv_;
 };
 
 struct SchedulerStats {

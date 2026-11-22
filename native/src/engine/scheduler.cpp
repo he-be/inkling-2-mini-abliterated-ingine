@@ -96,8 +96,16 @@ void Job::finish() {
   {
     std::lock_guard lock(mutex_);
     end_ = true;
+    done_ = true;
   }
   cv_.notify_all();
+  done_cv_.notify_all();
+}
+
+std::optional<model::GenerateStats> Job::wait_stats(Clock::duration timeout) const {
+  std::unique_lock lock(mutex_);
+  done_cv_.wait_for(lock, timeout, [&] { return done_; });
+  return stats_;
 }
 
 Scheduler::Scheduler(model::Generator& generator, std::vector<int32_t> stop_ids, int max_queue)
@@ -193,6 +201,8 @@ void Scheduler::run(Job& job) {
     // prefix reuse of the prompt: the path, the tokens reused and prefilled, the prefill time
     server_log().info("{}: reuse={} reused={} prefilled={} prefill={:.3f}s", job.id, model::to_string(st.reuse),
                       st.reused_tokens, st.prompt_tokens - st.reused_tokens, st.prefill_seconds);
+    std::lock_guard lock(job.mutex_);
+    job.stats_ = st;
   } catch (const std::exception& e) {  // report to the client instead of killing the worker
     server_log().error("generator failed: {}: {}", type_name(e), e.what());
     job.fail("generation failed: " + type_name(e) + ": " + e.what());

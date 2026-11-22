@@ -1,4 +1,5 @@
 #include "text/chat.h"
+#include "text/image.h"
 
 #include "text/jinja.h"
 #include "text/pyjson.h"
@@ -275,15 +276,30 @@ Json normalize_messages(const Json& messages) {
     if (is_none(content)) {
       m.erase("content");
     } else if (content->is_array()) {
+      Json parts = Json::array();
       for (const Json& part : *content) {
+        if (!part.is_string() && !part.is_object()) throw ChatError("content parts must be strings or objects");
         if (part.is_object()) {
           const Json* type = get(part, "type");
+          if (!is_none(type) && type->is_string() &&
+              (*type == "image_url" || *type == "image" || *type == "input_image")) {
+            // image part (fork: image input): {"type": "image", "_url": <data URL>} for the template
+            if (r != "user" && r != "tool") throw ChatError("image content is only supported in user and tool messages");
+            const Json* url = get(part, "image_url");
+            if (url == nullptr) url = get(part, "image");
+            if (url != nullptr && url->is_object()) url = get(*url, "url");
+            if (url == nullptr || !url->is_string())
+              throw ChatError("image part needs an image_url (data: URL, base64)");
+            parts.push_back(Json{{"type", "image"}, {"_url", *url}});
+            continue;
+          }
           if (!is_none(type) && !(*type == "text" || *type == "input_text")) {
-            throw ChatError("unsupported content part type " + py::repr(*type) + " (text only)");
+            throw ChatError("unsupported content part type " + py::repr(*type) + " (text and images only)");
           }
         }
-        if (!part.is_string() && !part.is_object()) throw ChatError("content parts must be strings or objects");
+        parts.push_back(part);
       }
+      m["content"] = std::move(parts);
     } else if (!content->is_string()) {
       throw ChatError("message content must be a string, a list of parts, or null");
     }
@@ -453,6 +469,42 @@ RenderedPrompt ChatFormat::render(const Json& messages, const Json& tools, const
     prompt.prefill_ids = no_thinking_prefill();
   }
   prompt.ids = encode_prompt(*data_, prompt.text);
+
+  // images: the template wrote one placeholder per image part; expand each to the image's token count
+  std::vector<std::string> urls;
+  for (const Json& m : context["messages"]) {
+    const Json* c = get(m, "content");
+    if (c == nullptr || !c->is_array()) continue;
+    for (const Json& p : *c)
+      if (const Json* u = p.is_object() ? get(p, "_url") : nullptr) urls.push_back(u->get<std::string>());
+  }
+  if (!urls.empty()) {
+    const std::optional<int32_t> ph = data_->tokenizer.token_id("<|unused_200054|>");
+    if (!ph) throw ChatError("the tokenizer has no image placeholder token", "messages");
+    std::vector<std::size_t> slots;
+    for (std::size_t i = 0; i < prompt.ids.size(); ++i)
+      if (prompt.ids[i] == *ph) slots.push_back(i);
+    if (slots.size() != urls.size())
+      throw ChatError(std::to_string(urls.size()) + " images but " + std::to_string(slots.size()) +
+                          " image placeholders in the prompt", "messages");
+    std::vector<int32_t> out;
+    std::size_t prev = 0;
+    for (std::size_t k = 0; k < urls.size(); ++k) {
+      ImageInput img;
+      try {
+        img = preprocess_image(decode_data_url(urls[k]));
+      } catch (const std::invalid_argument& e) {
+        throw ChatError(e.what(), "messages");
+      }
+      out.insert(out.end(), prompt.ids.begin() + std::ptrdiff_t(prev), prompt.ids.begin() + std::ptrdiff_t(slots[k]));
+      img.start = int(out.size());
+      out.insert(out.end(), std::size_t(img.n_tokens()), *ph);
+      prev = slots[k] + 1;
+      prompt.images.push_back(std::move(img));
+    }
+    out.insert(out.end(), prompt.ids.begin() + std::ptrdiff_t(prev), prompt.ids.end());
+    prompt.ids = std::move(out);
+  }
   return prompt;
 }
 

@@ -13,11 +13,13 @@
 #include "model/prefill.h"
 #include "model/runtime.h"
 #include "model/spec.h"
+#include "model/vision.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -62,6 +64,22 @@ class EngineGenerator final : public Generator {
         token_(sizeof(std::int32_t)),
         host_token_(sizeof(std::int32_t)) {
     if (options.prefill_chunk < 1) throw std::invalid_argument("prefill_chunk must be positive");
+    if (options.vision) {
+      vision_ = std::make_unique<VisionTower>(options.model_dir, rt_.stream());
+      // scratch for the encodes: the w13 codes of VRAM-resident layers, rewritten from host copies afterwards
+      std::vector<VisionTower::Region> regions;
+      std::size_t lent = 0;
+      for (int l = LAYERS - 1; l >= 0 && lent < kVisionScratch; --l) {
+        const Experts& ex = rt_.weights().layers[std::size_t(l)].experts;
+        if (ex.host) continue;
+        const std::size_t bytes = std::size_t(ex.w13.nb[3] * ex.w13.ne[3]);
+        vision_copies_.push_back(std::make_unique<MappedHostBuffer>(bytes));
+        CUDA_CHECK(cudaMemcpy(vision_copies_.back()->data(), ex.w13.data, bytes, cudaMemcpyDeviceToHost));
+        regions.push_back({ex.w13.data, vision_copies_.back()->data(), bytes});
+        lent += bytes;
+      }
+      vision_->borrow(std::move(regions));
+    }
     if (options.spec) {
       drafter_ = std::make_unique<Drafter>(options.model_dir, rt_.weights(), options.max_ctx, rt_.stream());
       drafter_->capture();
@@ -106,7 +124,7 @@ class EngineGenerator final : public Generator {
 
     auto t = std::chrono::steady_clock::now();
     try {
-      prefill(prompt, stats);
+      prefill(prompt, sampling.images, stats);
       stats.prompt_tokens = n;
       if (spec_) {
         std::int32_t token = sample(static_cast<const float*>(logits_.p), sampling, rng);
@@ -209,7 +227,24 @@ class EngineGenerator final : public Generator {
   //   live conversation, restore the parked one's checkpoint and prefill the rest.
   // * None: park the live conversation, reset and prefill everything.
   // After a prefill the checkpoint moves to the end of `ids`.
-  void prefill(std::span<const std::int32_t> ids, GenerateStats& stats) {
+  // Prompt identity for prefix reuse: an image's placeholder rows (the same token for every image) become
+  // negative keys from the image digest and the row, so only the same image at the same place is reused.
+  static std::vector<std::int32_t> prompt_keys(std::span<const std::int32_t> ids, std::span<const ImageInput> images) {
+    std::vector<std::int32_t> keys(ids.begin(), ids.end());
+    for (const ImageInput& img : images)
+      for (int j = 0; j < img.n_tokens() && img.start + j < int(keys.size()); ++j) {
+        std::uint64_t z = img.digest + 0x9E3779B97F4A7C15ull * std::uint64_t(j + 1);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        keys[std::size_t(img.start + j)] = -1 - std::int32_t((z ^ (z >> 31)) & 0x7fffffffu);
+      }
+    return keys;
+  }
+
+  void prefill(std::span<const std::int32_t> ids_in, std::span<const ImageInput> images, GenerateStats& stats) {
+    if (!images.empty() && !vision_) throw std::invalid_argument("image input needs ingine-serve --vision");
+    const std::vector<std::int32_t> key_store = prompt_keys(ids_in, images);
+    const std::span<const std::int32_t> ids(key_store);  // reuse decisions compare keys
     const std::vector<std::int32_t>& prev = tokens_in_state_;
     const std::size_t n = ids.size();
     const bool drafter_in_step = !drafter_ || drafter_->length() == int(prev.size());  // else a row is missing
@@ -246,16 +281,38 @@ class EngineGenerator final : public Generator {
     }
     st.length = int(start);  // decode steps advance the state without its host-side length
     const std::size_t chunk = std::size_t(options_.prefill_chunk);
+    // images reaching past the reused prefix: encoded now (device fp32 rows, freed after the prefill)
+    std::vector<std::pair<const ImageInput*, DeviceBuffer>> encoded;
+    for (const ImageInput& img : images)
+      if (std::size_t(img.start + img.n_tokens()) > start) {
+        DeviceBuffer rows(std::size_t(img.n_tokens()) * HIDDEN * sizeof(float));
+        vision_->encode(img, static_cast<float*>(rows.p));
+        if (const char* dump = std::getenv("INGINE_VISION_DUMP")) {  // debugging: the rows as raw fp32
+          std::vector<float> h(std::size_t(img.n_tokens()) * HIDDEN);
+          CUDA_CHECK(cudaMemcpy(h.data(), rows.p, h.size() * sizeof(float), cudaMemcpyDeviceToHost));
+          if (std::FILE* f = std::fopen(dump, "wb")) {
+            std::fwrite(h.data(), sizeof(float), h.size(), f);
+            std::fclose(f);
+          }
+        }
+        encoded.emplace_back(&img, std::move(rows));
+      }
     for (std::size_t s = start; s < n; s += chunk) {
       const int T = int(std::min(chunk, n - s));
-      CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, ids.data() + s, std::size_t(T) * sizeof(std::int32_t),
+      CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, ids_in.data() + s, std::size_t(T) * sizeof(std::int32_t),
                                  cudaMemcpyHostToDevice, stream));
+      std::vector<Prefiller::Inject> inject;
+      for (const auto& [img, rows] : encoded) {
+        const int a = std::max(img->start, int(s)), b = std::min(img->start + img->n_tokens(), int(s) + T);
+        if (a < b)
+          inject.push_back({a - int(s), b - a, static_cast<const float*>(rows.p) + std::size_t(a - img->start) * HIDDEN});
+      }
       Tensor taps;
       if (drafter_) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
       prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
-                     drafter_ ? &taps : nullptr);
+                     drafter_ ? &taps : nullptr, inject);
       if (drafter_) {
-        drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
+        drafter_->note_tokens(ids_in.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));
       }
     }
@@ -430,6 +487,9 @@ class EngineGenerator final : public Generator {
   Prefiller prefiller_;
   std::unique_ptr<Drafter> drafter_;
   std::unique_ptr<SpecLoop> spec_;
+  std::unique_ptr<VisionTower> vision_;
+  static constexpr std::size_t kVisionScratch = std::size_t(1100) << 20;  // a 4,096-token image needs ~0.9 GB
+  std::vector<std::unique_ptr<MappedHostBuffer>> vision_copies_;  // host copies of the lent expert tensors
   DeviceBuffer chunk_tokens_, logits_, token_, taps_;
   PinnedHostBuffer host_token_;
   // prompt checkpoint (save_checkpoint) and the prompt it holds (empty: none)

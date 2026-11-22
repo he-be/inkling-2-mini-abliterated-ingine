@@ -11,6 +11,7 @@
 //     ...<|content_model_end_sampling|>                                         -> end of turn
 #pragma once
 
+#include "ingine/image.h"
 #include "text/tokenizer.h"
 
 #include <nlohmann/json.hpp>
@@ -60,6 +61,8 @@ struct RenderedPrompt {
   std::vector<int32_t> ids;          // full prompt, prefill included
   std::string text;
   std::vector<int32_t> prefill_ids;  // tail of ids the model would otherwise have generated
+  // images in prompt order; each one's placeholder token is expanded to its n_tokens() (start = first one)
+  std::vector<ImageInput> images;
 };
 
 struct ToolCallDelta {

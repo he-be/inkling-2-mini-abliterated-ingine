@@ -5,6 +5,7 @@ add_library(ingine_model STATIC
   runtime.cpp
   generator.cpp
   model_kernels.cu
+  vision.cu
 )
 # prefill (package Prefill) and the speculative loop (package Spec)
 foreach(src prefill.cpp drafter.cpp spec.cpp)
@@ -22,7 +23,8 @@ target_link_libraries(ingine_model PUBLIC
   ingine_kernels_attn
   ingine_kernels_head
   nlohmann_json::nlohmann_json
-  CUDA::cudart)
+  CUDA::cudart
+  CUDA::cublas)
 foreach(area prefill draft)
   if(TARGET ingine_kernels_${area})
     target_link_libraries(ingine_model PUBLIC ingine_kernels_${area})
