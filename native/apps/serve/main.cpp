@@ -140,6 +140,8 @@ int main(int argc, char** argv) {
             "layers whose routed experts stay in page-locked RAM, read over PCIe (e.g. 0-3,18-23; '+' also separates)",
             &host_experts);
   ap.flag("--host-embed", "keep the token embedding table in page-locked RAM", &host_embed);
+  int prefill_chunk = 3072;
+  ap.option("--prefill-chunk", "", "tokens per prefill chunk (default 3072; smaller saves device memory)", &prefill_chunk);
   ap.option("--fake-delay", "", "seconds per fake token", &fake_delay);
   ap.option("--model-id", "", "model name reported by the API (default: generator.model_id)", &model_id);
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
@@ -192,6 +194,7 @@ int main(int argc, char** argv) {
       options.vision = !no_vision;
       options.host_layers = parse_layers(host_experts);
       options.host_embed = host_embed;
+      options.prefill_chunk = prefill_chunk;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");

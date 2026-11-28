@@ -97,6 +97,32 @@ Json usage(const Exchange& x) {
   return Json{{"prompt_tokens", prompt}, {"completion_tokens", completion}, {"total_tokens", prompt + completion}};
 }
 
+// llama.cpp-style timings of the request (fork): prompt = prefill of the new (non-reused) tokens, predicted =
+// the decode after the first token; "sampling" is what the sampler used (ingine has no min_p or penalties).
+Json timings(const Exchange& x) {
+  const std::optional<model::GenerateStats> st = x.job->wait_stats(std::chrono::seconds(5));
+  if (!st || st->prompt_tokens == 0) return nullptr;
+  const int n_prompt = st->prompt_tokens - st->reused_tokens;
+  Json t{{"cache_n", st->reused_tokens},
+         {"prompt_n", n_prompt},
+         {"prompt_ms", st->prefill_seconds * 1e3},
+         {"prompt_per_second", n_prompt / std::max(st->prefill_seconds, 1e-9)},
+         {"predicted_n", st->generated_tokens},
+         {"predicted_ms", st->decode_seconds * 1e3},
+         {"predicted_per_second", std::max(st->generated_tokens - 1, 0) / std::max(st->decode_seconds, 1e-9)},
+         {"reuse", model::to_string(st->reuse)}};
+  if (st->spec_rounds > 0) t["spec"] = Json{{"rounds", st->spec_rounds}, {"accepted", st->spec_accepted}};
+  const model::Sampling& s = x.job->sampling;
+  t["sampling"] = Json{{"temperature", s.temperature}, {"top_p", s.top_p}, {"top_k", s.top_k},
+                       {"seed", s.seed ? Json(*s.seed) : Json()}};
+  if (!x.job->images.empty()) {
+    t["images"] = int(x.job->images.size());
+    t["image_tokens"] = st->image_tokens;
+    t["vision_ms"] = st->vision_seconds * 1e3;
+  }
+  return t;
+}
+
 void log_done(const Exchange& x) {
   const Clock::time_point now = Clock::now();
   const engine::Job& job = *x.job;
@@ -279,7 +305,8 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
                                                  {"logprobs", nullptr},
                                                  {"finish_reason", result.finish_reason ? Json(*result.finish_reason)
                                                                                         : Json()}}})},
-                   {"usage", usage(*x)}});
+                   {"usage", usage(*x)},
+                   {"timings", timings(*x)}});
     return;
   }
 
@@ -312,7 +339,9 @@ void ChatServer::complete(const httplib::Request& req, httplib::Response& res, C
           if (x.failure) {
             transport.write(sse(dump(error_body(500, *x.failure))));
           } else {
-            transport.write(sse(dump(chunk(x, model_id_, Json::object(), x.parser.finish_reason()))));
+            Json last = chunk(x, model_id_, Json::object(), x.parser.finish_reason());
+            last["timings"] = timings(x);
+            transport.write(sse(dump(last)));
             if (x.req.include_usage) {
               transport.write(sse(dump(Json{{"id", x.job->id},
                                             {"object", "chat.completion.chunk"},

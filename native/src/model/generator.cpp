@@ -8,6 +8,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/host_memory.h"
 #include "kernels/head/head.h"
 #include "model/drafter.h"
 #include "model/prefill.h"
@@ -77,7 +78,23 @@ class EngineGenerator final : public Generator {
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
     checkpoint_ = DeviceBuffer(checkpoint_logits_ + logits_.bytes);
     // the vision tower's weights are resident: loaded before the park budget below is measured
-    if (options.vision) vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
+    // fork: with --host-experts the tower borrows the w13 codes of VRAM-resident layers (VisionRegion) instead
+    if (options.vision && options.host_layers.empty()) {
+      vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
+    } else if (options.vision) {
+      std::vector<VisionRegion> regions;
+      std::size_t lent = 0;
+      for (int l = LAYERS - 1; l >= 0 && lent < kVisionLend; --l) {
+        const Experts& ex = rt_.weights().layers[std::size_t(l)].experts;
+        if (ex.host) continue;
+        const std::size_t bytes = std::size_t(ex.w13.nb[3] * ex.w13.ne[3]);
+        vision_copies_.push_back(std::make_unique<MappedHostBuffer>(bytes));
+        CUDA_CHECK(cudaMemcpy(vision_copies_.back()->data(), ex.w13.data, bytes, cudaMemcpyDeviceToHost));
+        regions.push_back({ex.w13.data, vision_copies_.back()->data(), bytes});
+        lent += bytes;
+      }
+      vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream(), std::move(regions));
+    }
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
     if (options.park_mb < 0) {  // leave room for the workspaces a long prefill adds later
       std::size_t free = 0, total = 0;
@@ -511,7 +528,12 @@ class EngineGenerator final : public Generator {
   Prefiller prefiller_;
   std::unique_ptr<Drafter> drafter_;
   std::unique_ptr<SpecLoop> spec_;
-  std::unique_ptr<VisionEncoder> vision_;  // image input (RuntimeOptions::vision)
+  std::unique_ptr<VisionEncoder> vision_;
+  // fork: page-locked copies of the w13 codes lent to the vision tower (vision_ never reads them on its
+  // destruction, so the order does not matter)
+  std::vector<std::unique_ptr<MappedHostBuffer>> vision_copies_;
+  // lent: the weights (0.64 GB) and the workspace of a 4,096-token image (0.86 GB) in pieces of at most 0.27 GB
+  static constexpr std::size_t kVisionLend = std::size_t(2048) << 20;  // image input (RuntimeOptions::vision)
   DeviceBuffer chunk_tokens_, logits_, token_, taps_;
   PinnedHostBuffer host_token_;
   // prompt checkpoint (save_checkpoint) and the prompt it holds (empty: none)

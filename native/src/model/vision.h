@@ -53,11 +53,28 @@ struct VisionWeights {
 };
 
 // Reads model.visual.* from the checkpoint in model_dir; returns once the weights are on the device.
-VisionWeights load_vision_weights(const std::filesystem::path& model_dir, cudaStream_t stream);
+// alloc (fork): where each tensor goes (default: a DeviceBuffer of its own in VisionWeights::storage).
+VisionWeights load_vision_weights(const std::filesystem::path& model_dir, cudaStream_t stream,
+                                  const std::function<void*(std::size_t)>& alloc = {});
+
+// Device memory lent to the encoder (Windows/16 GB fork): `bytes` at `device` that belong to someone else
+// (the w13 codes of VRAM-resident layers) and `host`, a page-locked copy of them. The encoder keeps its
+// weights in RAM, writes them and its workspace over the regions for the duration of encode(), and rewrites
+// the regions from `host` before it returns, so the owner's addresses (and CUDA graphs) stay valid.
+struct VisionRegion {
+  void* device = nullptr;
+  const void* host = nullptr;
+  std::size_t bytes = 0;
+};
 
 class VisionEncoder {
  public:
   VisionEncoder(const std::filesystem::path& model_dir, cudaStream_t stream);
+  // Borrowed mode (fork): no resident device memory; see VisionRegion.
+  VisionEncoder(const std::filesystem::path& model_dir, cudaStream_t stream, std::vector<VisionRegion> regions);
+  ~VisionEncoder();
+  VisionEncoder(const VisionEncoder&) = delete;
+  VisionEncoder& operator=(const VisionEncoder&) = delete;
 
   // Embeddings of the image rgb u8 [height, width, 3] (host): bf16 [padded_tokens(N), 2304] on the device,
   // rows [0, N) for its N = ceil(height / 40) * ceil(width / 40) tokens in raster order (the rest is
@@ -67,6 +84,7 @@ class VisionEncoder {
   [[nodiscard]] static int padded_tokens(int tokens) { return (tokens + 15) / 16 * 16; }
   [[nodiscard]] std::size_t workspace_bytes(int height, int width) const;
   [[nodiscard]] std::size_t weight_bytes() const { return weights_.bytes; }
+  [[nodiscard]] bool borrowed() const { return !regions_.empty(); }
 
   // Device memory for the attention scores and probabilities of one chunk of queries (default 256 MiB):
   // the queries per GEMM are what fits, at least 64.
@@ -81,6 +99,13 @@ class VisionEncoder {
   VisionWeights weights_;
   kernels::prefill::Gemm gemm_;
   std::size_t score_bytes_ = std::size_t(256) << 20;
+
+  // borrowed mode: the lent regions, the bytes of each the weights take, and the weights' page-locked images
+  std::vector<VisionRegion> regions_;
+  std::vector<std::size_t> weight_used_;
+  std::vector<void*> weight_images_;
+  DeviceBuffer encode_in(const std::uint8_t* rgb, int height, int width,
+                         const std::function<void*(std::size_t)>& take);
 };
 
 }  // namespace ingine::model

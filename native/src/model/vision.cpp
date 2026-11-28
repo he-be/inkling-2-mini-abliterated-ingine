@@ -24,12 +24,14 @@ int round_up(int v, int to) { return (v + to - 1) / to * to; }
 // stored in, straight from the file; vectors widened to FP32 on the host (exact).
 class Loader {
  public:
-  Loader(const SafetensorsModel& m, std::vector<DeviceBuffer>& storage, std::size_t& bytes)
-      : m_(m), storage_(storage), bytes_(bytes) {}
+  Loader(const SafetensorsModel& m, std::vector<DeviceBuffer>& storage, std::size_t& bytes,
+         const std::function<void*(std::size_t)>& place)
+      : m_(m), storage_(storage), bytes_(bytes), place_(place) {}
 
   void* alloc(std::size_t bytes) {
-    storage_.emplace_back(bytes);
     bytes_ += bytes;
+    if (place_) return place_(bytes);
+    storage_.emplace_back(bytes);
     return storage_.back().p;
   }
 
@@ -83,18 +85,20 @@ class Loader {
   const SafetensorsModel& m_;
   std::vector<DeviceBuffer>& storage_;
   std::size_t& bytes_;
+  const std::function<void*(std::size_t)>& place_;
   std::vector<UploadRequest> pending_;
 };
 
 }  // namespace
 
-VisionWeights load_vision_weights(const std::filesystem::path& model_dir, cudaStream_t stream) {
+VisionWeights load_vision_weights(const std::filesystem::path& model_dir, cudaStream_t stream,
+                                  const std::function<void*(std::size_t)>& alloc) {
   const SafetensorsModel m(model_dir);
   if (!m.contains("model.visual.proj_out.weight")) {
     throw std::runtime_error("the checkpoint in " + model_dir.string() + " has no vision tower (model.visual.*)");
   }
   VisionWeights w;
-  Loader ld(m, w.storage, w.bytes);
+  Loader ld(m, w.storage, w.bytes, alloc);
   const std::string emb = "model.visual.backbone.embeddings.";
   w.patch_w = ld.matrix(emb + "patch_embedding.weight", H, vk::PATCH_DIM);
   w.pos = ld.f32(emb + "position_embedding", std::int64_t(vk::POS_GRID) * vk::POS_GRID * H);
@@ -144,6 +148,77 @@ VisionEncoder::VisionEncoder(const std::filesystem::path& model_dir, cudaStream_
 
 namespace {
 
+// First-fit bump allocation over lent regions (256-byte aligned); `used` holds each region's high-water mark.
+struct RegionBump {
+  const std::vector<VisionRegion>& regions;
+  std::vector<std::size_t> used;
+  std::vector<DeviceBuffer> own;  // pieces no region could hold (slow on Windows: may spill to shared memory)
+  explicit RegionBump(const std::vector<VisionRegion>& r, std::vector<std::size_t> start = {})
+      : regions(r), used(start.empty() ? std::vector<std::size_t>(r.size(), 0) : std::move(start)) {}
+  void* take(std::size_t bytes) {
+    bytes = (bytes + 255) / 256 * 256;
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+      if (regions[i].bytes - used[i] >= bytes) {
+        void* p = static_cast<std::byte*>(regions[i].device) + used[i];
+        used[i] += bytes;
+        return p;
+      }
+    }
+    own.emplace_back(bytes);
+    return own.back().p;
+  }
+  // rewrites the bytes of every region taken so far from the owner's copy
+  void restore(cudaStream_t s) const {
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+      if (used[i] > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(regions[i].device, regions[i].host, used[i], cudaMemcpyHostToDevice, s));
+      }
+    }
+  }
+};
+
+}  // namespace
+
+VisionEncoder::VisionEncoder(const std::filesystem::path& model_dir, cudaStream_t stream,
+                             std::vector<VisionRegion> regions)
+    : stream_(stream), regions_(std::move(regions)) {
+  if (regions_.empty()) throw std::invalid_argument("VisionEncoder: no regions to borrow");
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  RegionBump bump(regions_);
+  try {
+    weights_ = load_vision_weights(model_dir, stream, [&](std::size_t b) { return bump.take(b); });
+    if (!bump.own.empty()) throw std::runtime_error("VisionEncoder: the lent regions cannot hold the vision weights");
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    weight_used_ = bump.used;
+    for (std::size_t i = 0; i < regions_.size(); ++i) {  // the weights' images in page-locked RAM
+      void* img = nullptr;
+      if (weight_used_[i] > 0) {
+        CUDA_CHECK(cudaMallocHost(&img, weight_used_[i]));
+        CUDA_CHECK(cudaMemcpy(img, regions_[i].device, weight_used_[i], cudaMemcpyDeviceToHost));
+      }
+      weight_images_.push_back(img);
+    }
+  } catch (...) {
+    cudaStreamSynchronize(stream);
+    bump.restore(stream);
+    cudaStreamSynchronize(stream);
+    for (void* p : weight_images_) {
+      if (p) cudaFreeHost(p);
+    }
+    throw;
+  }
+  bump.restore(stream);
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+VisionEncoder::~VisionEncoder() {
+  for (void* p : weight_images_) {
+    if (p) cudaFreeHost(p);
+  }
+}
+
+namespace {
+
 struct Layout {
   int N, S, Sp, Np, Qc;
   std::size_t pixels, h, xb, big32, big16, attn, y, scores, probs, total;
@@ -187,23 +262,60 @@ std::size_t VisionEncoder::workspace_bytes(int height, int width) const {
 DeviceBuffer VisionEncoder::encode(const std::uint8_t* rgb, int height, int width) {
   if (!rgb || height < 1 || width < 1) throw std::invalid_argument("VisionEncoder::encode: empty image");
   const int rows = (height + vk::TILE - 1) / vk::TILE, cols = (width + vk::TILE - 1) / vk::TILE;
+  if (regions_.empty()) {
+    const Layout L = layout(height, width, score_bytes_);
+    DeviceBuffer work(L.total);
+    std::size_t at = 0;
+    return encode_in(rgb, height, width, [&](std::size_t bytes) {
+      void* p = static_cast<std::byte*>(work.p) + at;
+      at += (bytes + 255) / 256 * 256;
+      return p;
+    });
+  }
+  // borrowed: nothing queued may still read the lent bytes; then the weights, the encode, the owner's bytes back
+  CUDA_CHECK(cudaStreamSynchronize(stream_));
+  RegionBump bump(regions_, weight_used_);
+  try {
+    for (std::size_t i = 0; i < regions_.size(); ++i) {
+      if (weight_used_[i] > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(regions_[i].device, weight_images_[i], weight_used_[i], cudaMemcpyHostToDevice,
+                                   stream_));
+      }
+    }
+    DeviceBuffer out = encode_in(rgb, height, width, [&](std::size_t b) { return bump.take(b); });
+    bump.restore(stream_);
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    return out;
+  } catch (...) {
+    cudaStreamSynchronize(stream_);
+    bump.restore(stream_);
+    cudaStreamSynchronize(stream_);
+    throw;
+  }
+}
+
+DeviceBuffer VisionEncoder::encode_in(const std::uint8_t* rgb, int height, int width,
+                                      const std::function<void*(std::size_t)>& take) {
+  const int rows = (height + vk::TILE - 1) / vk::TILE, cols = (width + vk::TILE - 1) / vk::TILE;
   const Layout L = layout(height, width, score_bytes_);
   const int Sp = L.Sp;
   const cudaStream_t s = stream_;
   const VisionWeights& w = weights_;
 
   DeviceBuffer out(std::size_t(L.Np) * VISION_OUT * 2);
-  DeviceBuffer work(L.total);
-  auto at = [&](std::size_t off) { return static_cast<std::byte*>(work.p) + off; };
-  auto* pixels = reinterpret_cast<std::uint8_t*>(at(L.pixels));
-  auto* h = reinterpret_cast<float*>(at(L.h));
-  auto* xb = reinterpret_cast<__nv_bfloat16*>(at(L.xb));
-  auto* big32 = reinterpret_cast<float*>(at(L.big32));
-  auto* big16 = reinterpret_cast<__nv_bfloat16*>(at(L.big16));
-  auto* attn = reinterpret_cast<__nv_bfloat16*>(at(L.attn));
-  auto* y = reinterpret_cast<float*>(at(L.y));
-  auto* scores = reinterpret_cast<float*>(at(L.scores));
-  auto* probs = reinterpret_cast<__nv_bfloat16*>(at(L.probs));
+  // the workspace pieces in layout order (sizes from the offsets): one block, or first fit over lent regions
+  const std::size_t offs[] = {L.pixels, L.h, L.xb, L.big32, L.big16, L.attn, L.y, L.scores, L.probs, L.total};
+  void* piece[9];
+  for (int i = 0; i < 9; ++i) piece[i] = take(offs[i + 1] - offs[i]);
+  auto* pixels = static_cast<std::uint8_t*>(piece[0]);
+  auto* h = static_cast<float*>(piece[1]);
+  auto* xb = static_cast<__nv_bfloat16*>(piece[2]);
+  auto* big32 = static_cast<float*>(piece[3]);
+  auto* big16 = static_cast<__nv_bfloat16*>(piece[4]);
+  auto* attn = static_cast<__nv_bfloat16*>(piece[5]);
+  auto* y = static_cast<float*>(piece[6]);
+  auto* scores = static_cast<float*>(piece[7]);
+  auto* probs = static_cast<__nv_bfloat16*>(piece[8]);
 
   // patches -> patch embedding + position embeddings, class token in front, ln_pre
   CUDA_CHECK(cudaMemcpyAsync(pixels, rgb, std::size_t(height) * width * 3, cudaMemcpyHostToDevice, s));
